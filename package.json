@@ -1,6 +1,20 @@
 {
   "name": "action-send-mail",
-  "main": "main.js",
+  "main": "dist/index.js",
+  "description": "An action that simply sends a mail to multiple recipients.",
+  "version": "0.0.0",
+  "scripts": {
+    "build": "rm -rf dist && ncc build main.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/step-security/action-send-mail.git"
+  },
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/step-security/action-send-mail/issues"
+  },
+  "homepage": "https://github.com/step-security/action-send-mail#readme",
   "dependencies": {
     "@actions/core": "^1.10.1",
     "axios": "^1.6.2",
