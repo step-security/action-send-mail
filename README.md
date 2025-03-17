@@ -14,7 +14,7 @@ Some features:
 
 ```yaml
 - name: Send mail
-  uses: step-security/action-send-mail@v3
+  uses: step-security/action-send-mail@v4
   with:
     # Specify connection via URL (replaces server_address, server_port, secure,
     # username and password)
