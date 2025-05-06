@@ -14,7 +14,7 @@ Some features:
 
 ```yaml
 - name: Send mail
-  uses: step-security/action-send-mail@v4
+  uses: step-security/action-send-mail@v5
   with:
     # Specify connection via URL (replaces server_address, server_port, secure,
     # username and password)
@@ -64,6 +64,10 @@ Some features:
     nodemailerlog: false
     # Optional nodemailerdebug: true/false if true lognodem will also be set true
     nodemailerdebug: false
+    # Optional custom SMTP MAIL FROM address (overrides username):
+    envelope_from: mailer@example.com
+    # Optional custom SMTP RCPT TO addresses (overrides to, cc, bcc):
+    envelope_to: mailer@example.com,admin@example.com
 ```
 
 ## Troubleshooting
