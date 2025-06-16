@@ -44,7 +44,7 @@ async function getAttachments(attachments) {
 
 function sleep(ms) {
     return new Promise((resolve) => {
-        setTimeout(resolve, ms);
+       setTimeout(resolve, ms);
     });
 }
 
@@ -68,7 +68,7 @@ async function validateSubscription() {
 
 async function main() {
     try {
-         await validateSubscription();
+        await validateSubscription();
 
         let serverAddress = core.getInput("server_address");
         let serverPort = core.getInput("server_port");
