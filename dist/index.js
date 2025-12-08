@@ -7497,9 +7497,10 @@ function regExpEscape (s) {
  * Converts tokens for a single address into an address object
  *
  * @param {Array} tokens Tokens object
+ * @param {Number} depth Current recursion depth for nested group protection
  * @return {Object} Address object
  */
-function _handleAddress(tokens) {
+function _handleAddress(tokens, depth) {
     let isGroup = false;
     let state = 'text';
     let address;
@@ -7580,7 +7581,7 @@ function _handleAddress(tokens) {
         // Parse group members, but flatten any nested groups (RFC 5322 doesn't allow nesting)
         let groupMembers = [];
         if (data.group.length) {
-            let parsedGroup = addressparser(data.group.join(','));
+            let parsedGroup = addressparser(data.group.join(','), { _depth: depth + 1 });
             // Flatten: if any member is itself a group, extract its members into the sequence
             parsedGroup.forEach(member => {
                 if (member.group) {
@@ -7793,6 +7794,13 @@ class Tokenizer {
 }
 
 /**
+ * Maximum recursion depth for parsing nested groups.
+ * RFC 5322 doesn't allow nested groups, so this is a safeguard against
+ * malicious input that could cause stack overflow.
+ */
+const MAX_NESTED_GROUP_DEPTH = 50;
+
+/**
  * Parses structured e-mail addresses from an address field
  *
  * Example:
@@ -7804,10 +7812,18 @@ class Tokenizer {
  *     [{name: 'Name', address: 'address@domain'}]
  *
  * @param {String} str Address field
+ * @param {Object} options Optional options object
+ * @param {Number} options._depth Internal recursion depth counter (do not set manually)
  * @return {Array} An array of address objects
  */
 function addressparser(str, options) {
     options = options || {};
+    let depth = options._depth || 0;
+
+    // Prevent stack overflow from deeply nested groups (DoS protection)
+    if (depth > MAX_NESTED_GROUP_DEPTH) {
+        return [];
+    }
 
     let tokenizer = new Tokenizer(str);
     let tokens = tokenizer.tokenize();
@@ -7832,7 +7848,7 @@ function addressparser(str, options) {
     }
 
     addresses.forEach(address => {
-        address = _handleAddress(address);
+        address = _handleAddress(address, depth);
         if (address.length) {
             parsedAddresses = parsedAddresses.concat(address);
         }
@@ -9968,14 +9984,27 @@ class MailComposer {
             return element;
         }
 
-        if (dataUrl.length > 100000) {
-            // 100KB limit for data URL string
+        if (dataUrl.length > 52428800) {
+            // 52428800 chars = 50MB limit for data URL string (~37.5MB decoded image)
+            // Extract content type before rejecting to preserve MIME type
+            let detectedType = 'application/octet-stream';
+            const commaPos = dataUrl.indexOf(',');
+
+            if (commaPos > 0 && commaPos < 200) {
+                // Parse header safely with size limit
+                const header = dataUrl.substring(5, commaPos); // skip 'data:'
+                const parts = header.split(';');
+                if (parts[0] && parts[0].includes('/')) {
+                    detectedType = parts[0].trim();
+                }
+            }
+
             // Return empty content for excessively long data URLs
             return Object.assign({}, element, {
                 path: false,
                 href: false,
                 content: Buffer.alloc(0),
-                contentType: element.contentType || 'application/octet-stream'
+                contentType: element.contentType || detectedType
             });
         }
 
@@ -18523,8 +18552,8 @@ class SMTPConnection extends EventEmitter {
             }
             notify = notify.map(n => n.trim().toUpperCase());
             let validNotify = ['NEVER', 'SUCCESS', 'FAILURE', 'DELAY'];
-            let invaliNotify = notify.filter(n => !validNotify.includes(n));
-            if (invaliNotify.length || (notify.length > 1 && notify.includes('NEVER'))) {
+            let invalidNotify = notify.filter(n => !validNotify.includes(n));
+            if (invalidNotify.length || (notify.length > 1 && notify.includes('NEVER'))) {
                 throw new Error('notify: ' + JSON.stringify(notify.join(',')));
             }
             notify = notify.join(',');
@@ -32544,7 +32573,7 @@ module.exports = JSON.parse('{"126":{"description":"126 Mail (NetEase)","host":"
 /***/ ((module) => {
 
 "use strict";
-module.exports = JSON.parse('{"name":"nodemailer","version":"7.0.9","description":"Easy as cake e-mail sending from your Node.js applications","main":"lib/nodemailer.js","scripts":{"test":"node --test --test-concurrency=1 test/**/*.test.js test/**/*-test.js","test:coverage":"c8 node --test --test-concurrency=1 test/**/*.test.js test/**/*-test.js","format":"prettier --write \\"**/*.{js,json,md}\\"","format:check":"prettier --check \\"**/*.{js,json,md}\\"","lint":"eslint .","lint:fix":"eslint . --fix","update":"rm -rf node_modules/ package-lock.json && ncu -u && npm install"},"repository":{"type":"git","url":"https://github.com/nodemailer/nodemailer.git"},"keywords":["Nodemailer"],"author":"Andris Reinman","license":"MIT-0","bugs":{"url":"https://github.com/nodemailer/nodemailer/issues"},"homepage":"https://nodemailer.com/","devDependencies":{"@aws-sdk/client-sesv2":"3.901.0","bunyan":"1.8.15","c8":"10.1.3","eslint":"^9.37.0","eslint-config-prettier":"^10.1.8","globals":"^16.4.0","libbase64":"1.3.0","libmime":"5.3.7","libqp":"2.1.1","nodemailer-ntlm-auth":"1.0.4","prettier":"^3.6.2","proxy":"1.0.2","proxy-test-server":"1.0.0","smtp-server":"3.14.0"},"engines":{"node":">=6.0.0"}}');
+module.exports = JSON.parse('{"name":"nodemailer","version":"7.0.11","description":"Easy as cake e-mail sending from your Node.js applications","main":"lib/nodemailer.js","scripts":{"test":"node --test --test-concurrency=1 test/**/*.test.js test/**/*-test.js","test:coverage":"c8 node --test --test-concurrency=1 test/**/*.test.js test/**/*-test.js","format":"prettier --write \\"**/*.{js,json,md}\\"","format:check":"prettier --check \\"**/*.{js,json,md}\\"","lint":"eslint .","lint:fix":"eslint . --fix","update":"rm -rf node_modules/ package-lock.json && ncu -u && npm install"},"repository":{"type":"git","url":"https://github.com/nodemailer/nodemailer.git"},"keywords":["Nodemailer"],"author":"Andris Reinman","license":"MIT-0","bugs":{"url":"https://github.com/nodemailer/nodemailer/issues"},"homepage":"https://nodemailer.com/","devDependencies":{"@aws-sdk/client-sesv2":"3.940.0","bunyan":"1.8.15","c8":"10.1.3","eslint":"9.39.1","eslint-config-prettier":"10.1.8","globals":"16.5.0","libbase64":"1.3.0","libmime":"5.3.7","libqp":"2.1.1","nodemailer-ntlm-auth":"1.0.4","prettier":"3.6.2","proxy":"1.0.2","proxy-test-server":"1.0.0","smtp-server":"3.16.1"},"engines":{"node":">=6.0.0"}}');
 
 /***/ })
 
