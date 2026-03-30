@@ -3621,7 +3621,7 @@ function expand(str, isTop) {
     var y = numeric(n[1]);
     var width = Math.max(n[0].length, n[1].length)
     var incr = n.length == 3
-      ? Math.abs(numeric(n[2]))
+      ? Math.max(Math.abs(numeric(n[2])), 1)
       : 1;
     var test = lte;
     var reverse = y < x;
@@ -3668,7 +3668,6 @@ function expand(str, isTop) {
 
   return expansions;
 }
-
 
 
 /***/ }),
@@ -9586,7 +9585,8 @@ class MailComposer {
                 // also contains `false`, to set
                 contentTransferEncoding = attachment.contentTransferEncoding;
             } else if (isMessageNode) {
-                contentTransferEncoding = '7bit';
+                // the content might include non-ASCII bytes but at this point we do not know it yet
+                contentTransferEncoding = '8bit';
             } else {
                 contentTransferEncoding = 'base64'; // the default
             }
@@ -18271,7 +18271,12 @@ class SMTPConnection extends EventEmitter {
 
         err = this._formatError(err, type, data, command);
 
-        this.logger.error(data, err.message);
+        const transientCodes = ['ETIMEDOUT', 'ESOCKET', 'ECONNECTION'];
+        if (transientCodes.includes(err.code)) {
+            this.logger.warn(data, err.message);
+        } else {
+            this.logger.error(data, err.message);
+        }
 
         this.emit('error', err);
         this.close();
@@ -18593,6 +18598,23 @@ class SMTPConnection extends EventEmitter {
             }
         }
 
+        // RFC 8689: If the envelope requests REQUIRETLS extension
+        // then append REQUIRETLS keyword to the MAIL FROM command
+        // Note: REQUIRETLS can only be used over TLS connections and requires server support
+        if (this._envelope.requireTLSExtensionEnabled) {
+            if (!this.secure) {
+                return callback(
+                    this._formatError('REQUIRETLS can only be used over TLS connections (RFC 8689)', 'EREQUIRETLS', false, 'MAIL FROM')
+                );
+            }
+            if (!this._supportedExtensions.includes('REQUIRETLS')) {
+                return callback(
+                    this._formatError('Server does not support REQUIRETLS extension (RFC 8689)', 'EREQUIRETLS', false, 'MAIL FROM')
+                );
+            }
+            args.push('REQUIRETLS');
+        }
+
         this._sendCommand('MAIL FROM:<' + this._envelope.from + '>' + (args.length ? ' ' + args.join(' ') : ''));
     }
 
@@ -18812,6 +18834,11 @@ class SMTPConnection extends EventEmitter {
         // Detect if the server supports 8BITMIME
         if (/[ -]8BITMIME\b/im.test(str)) {
             this._supportedExtensions.push('8BITMIME');
+        }
+
+        // Detect if the server supports REQUIRETLS (RFC 8689)
+        if (/[ -]REQUIRETLS\b/im.test(str)) {
+            this._supportedExtensions.push('REQUIRETLS');
         }
 
         // Detect if the server supports PIPELINING
@@ -19659,7 +19686,7 @@ class SMTPPool extends EventEmitter {
         // resource is terminated with an error
         connection.once('error', err => {
             if (err.code !== 'EMAXLIMIT') {
-                this.logger.error(
+                this.logger.warn(
                     {
                         err,
                         tnx: 'pool',
@@ -20190,6 +20217,11 @@ class PoolResource extends EventEmitter {
             envelope.dsn = mail.data.dsn;
         }
 
+        // RFC 8689: Pass requireTLSExtensionEnabled to envelope for MAIL FROM parameter
+        if (mail.data.requireTLSExtensionEnabled) {
+            envelope.requireTLSExtensionEnabled = mail.data.requireTLSExtensionEnabled;
+        }
+
         this.connection.send(envelope, mail.message.createReadStream(), (err, info) => {
             this.messages++;
 
@@ -20463,6 +20495,11 @@ class SMTPTransport extends EventEmitter {
 
                 if (mail.data.dsn) {
                     envelope.dsn = mail.data.dsn;
+                }
+
+                // RFC 8689: Pass requireTLSExtensionEnabled to envelope for MAIL FROM parameter
+                if (mail.data.requireTLSExtensionEnabled) {
+                    envelope.requireTLSExtensionEnabled = mail.data.requireTLSExtensionEnabled;
                 }
 
                 this.logger.info(
@@ -32980,7 +33017,7 @@ module.exports = JSON.parse('{"126":{"description":"126 Mail (NetEase)","host":"
 /***/ ((module) => {
 
 "use strict";
-module.exports = JSON.parse('{"name":"nodemailer","version":"7.0.11","description":"Easy as cake e-mail sending from your Node.js applications","main":"lib/nodemailer.js","scripts":{"test":"node --test --test-concurrency=1 test/**/*.test.js test/**/*-test.js","test:coverage":"c8 node --test --test-concurrency=1 test/**/*.test.js test/**/*-test.js","format":"prettier --write \\"**/*.{js,json,md}\\"","format:check":"prettier --check \\"**/*.{js,json,md}\\"","lint":"eslint .","lint:fix":"eslint . --fix","update":"rm -rf node_modules/ package-lock.json && ncu -u && npm install"},"repository":{"type":"git","url":"https://github.com/nodemailer/nodemailer.git"},"keywords":["Nodemailer"],"author":"Andris Reinman","license":"MIT-0","bugs":{"url":"https://github.com/nodemailer/nodemailer/issues"},"homepage":"https://nodemailer.com/","devDependencies":{"@aws-sdk/client-sesv2":"3.940.0","bunyan":"1.8.15","c8":"10.1.3","eslint":"9.39.1","eslint-config-prettier":"10.1.8","globals":"16.5.0","libbase64":"1.3.0","libmime":"5.3.7","libqp":"2.1.1","nodemailer-ntlm-auth":"1.0.4","prettier":"3.6.2","proxy":"1.0.2","proxy-test-server":"1.0.0","smtp-server":"3.16.1"},"engines":{"node":">=6.0.0"}}');
+module.exports = JSON.parse('{"name":"nodemailer","version":"7.0.13","description":"Easy as cake e-mail sending from your Node.js applications","main":"lib/nodemailer.js","scripts":{"test":"node --test --test-concurrency=1 test/**/*.test.js test/**/*-test.js","test:coverage":"c8 node --test --test-concurrency=1 test/**/*.test.js test/**/*-test.js","format":"prettier --write \\"**/*.{js,json,md}\\"","format:check":"prettier --check \\"**/*.{js,json,md}\\"","lint":"eslint .","lint:fix":"eslint . --fix","update":"rm -rf node_modules/ package-lock.json && ncu -u && npm install"},"repository":{"type":"git","url":"https://github.com/nodemailer/nodemailer.git"},"keywords":["Nodemailer"],"author":"Andris Reinman","license":"MIT-0","bugs":{"url":"https://github.com/nodemailer/nodemailer/issues"},"homepage":"https://nodemailer.com/","devDependencies":{"@aws-sdk/client-sesv2":"3.975.0","bunyan":"1.8.15","c8":"10.1.3","eslint":"9.39.2","eslint-config-prettier":"10.1.8","globals":"17.1.0","libbase64":"1.3.0","libmime":"5.3.7","libqp":"2.1.1","nodemailer-ntlm-auth":"1.0.4","prettier":"3.8.1","proxy":"1.0.2","proxy-test-server":"1.0.0","smtp-server":"3.18.0"},"engines":{"node":">=6.0.0"}}');
 
 /***/ })
 
