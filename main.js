@@ -136,6 +136,7 @@ async function main() {
             required: false,
         });
         const envelopeTo = core.getInput("envelope_to", { required: false });
+        const headers = core.getInput("headers", { required: false });
 
         // if neither to, cc or bcc is provided, throw error
         if (!to && !cc && !bcc) {
@@ -187,6 +188,7 @@ async function main() {
                         ? getText(htmlBody, convertMarkdown)
                         : undefined,
                     priority: priority ? priority : undefined,
+                    headers: headers ? JSON.parse(headers) : undefined,
                     attachments: attachments
                         ? await getAttachments(attachments)
                         : undefined,
