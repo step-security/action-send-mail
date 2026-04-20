@@ -1,10 +1,9 @@
-const nodemailer = require("nodemailer");
-const core = require("@actions/core");
-const axios = require('axios');
-const glob = require("@actions/glob");
-const fs = require("fs");
-const showdown = require("showdown");
-const path = require("path");
+import nodemailer from "nodemailer";
+import * as core from "@actions/core";
+import * as glob from "@actions/glob";
+import fs from "node:fs";
+import showdown from "showdown";
+import path from "node:path";
 
 function getText(textOrFile, convertMarkdown) {
     let text = textOrFile;
@@ -136,6 +135,7 @@ async function main() {
             required: false,
         });
         const envelopeTo = core.getInput("envelope_to", { required: false });
+        const headers = core.getInput("headers", { required: false });
 
         // if neither to, cc or bcc is provided, throw error
         if (!to && !cc && !bcc) {
@@ -187,6 +187,7 @@ async function main() {
                         ? getText(htmlBody, convertMarkdown)
                         : undefined,
                     priority: priority ? priority : undefined,
+                    headers: headers ? JSON.parse(headers) : undefined,
                     attachments: attachments
                         ? await getAttachments(attachments)
                         : undefined,
