@@ -72,5 +72,5 @@ inputs:
     description: Custom envelope recipient addresses for SMTP RCPT TO command (separated with comma)
     required: false
 runs:
-  using: node20
+  using: node24
   main: "dist/index.js"
