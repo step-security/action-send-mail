@@ -51287,7 +51287,7 @@ function error(message, properties = {}) {
  * @param properties optional properties to add to the annotation.
  */
 function warning(message, properties = {}) {
-    issueCommand('warning', toCommandProperties(properties), message instanceof Error ? message.toString() : message);
+    command_issueCommand('warning', utils_toCommandProperties(properties), message instanceof Error ? message.toString() : message);
 }
 /**
  * Adds a notice issue
@@ -52531,7 +52531,14 @@ async function main() {
         // Either: "Plain Simple Name <user@doma.in>" or just "user@doma.in" (without the <>)
         let parsed = addressparser_default()(from);
         if (parsed.length != 1 || parsed[0].address == '') {
-            throw new Error("'from' address is invalid");
+            // Report an error only if the user did not set envelope_from. Otherwise, envelope_from
+            // overrides from anyway and from is used as is (but Nodemailer will remove
+            // the From: header completely).
+            if (envelopeFrom) {
+                warning("'from' address is invalid. Nodemailer will not create a 'From:' header.");
+            } else {
+                throw new Error("'from' address is invalid. Maybe you want to set 'envelope_from' to a valid sender address?");
+            }
         }
 
         // if neither to, cc or bcc is provided, throw error
