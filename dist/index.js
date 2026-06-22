@@ -2104,6 +2104,18 @@ var hasOwn = __nccwpck_require__(2157);
 var populate = __nccwpck_require__(7142);
 
 /**
+ * Escape CR, LF, and `"` in a multipart `name`/`filename` parameter, so a field
+ * name or filename can not break out of its header line to inject headers or
+ * smuggle additional parts. Matches the WHATWG HTML multipart/form-data encoding.
+ *
+ * @param {string} str - the parameter value to escape
+ * @returns {string} the escaped value
+ */
+function escapeHeaderParam(str) {
+  return String(str).replace(/\r/g, '%0D').replace(/\n/g, '%0A').replace(/"/g, '%22');
+}
+
+/**
  * Create readable "multipart/form-data" streams.
  * Can be used to submit forms
  * and file uploads to other web applications.
@@ -2268,7 +2280,7 @@ FormData.prototype._multiPartHeader = function (field, value, options) {
   var contents = '';
   var headers = {
     // add custom disposition as third element or keep it two elements if not
-    'Content-Disposition': ['form-data', 'name="' + field + '"'].concat(contentDisposition || []),
+    'Content-Disposition': ['form-data', 'name="' + escapeHeaderParam(field) + '"'].concat(contentDisposition || []),
     // if no content type. allow it to be empty array
     'Content-Type': [].concat(contentType || [])
   };
@@ -2322,7 +2334,7 @@ FormData.prototype._getContentDisposition = function (value, options) { // eslin
   }
 
   if (filename) {
-    return 'filename="' + filename + '"';
+    return 'filename="' + escapeHeaderParam(filename) + '"';
   }
 };
 
@@ -5060,12 +5072,12 @@ function wrap(str, lineLength) {
     const chunkLength = lineLength * 1024;
     const wrapRegex = new RegExp('.{' + lineLength + '}', 'g');
     while (pos < str.length) {
-        const wrappedLines = str.substr(pos, chunkLength).replace(wrapRegex, '$&\r\n');
+        const wrappedLines = str.substr(pos, chunkLength).replace(wrapRegex, '$&\r\n').trim();
         result.push(wrappedLines);
         pos += chunkLength;
     }
 
-    return result.join('');
+    return result.join('\r\n').trim();
 }
 
 /**
@@ -5119,20 +5131,17 @@ class Encoder extends Transform {
         if (this.options.lineLength) {
             b64 = wrap(b64, this.options.lineLength);
 
+            // remove last line as it is still most probably incomplete
             const lastLF = b64.lastIndexOf('\n');
             if (lastLF < 0) {
                 this._curLine = b64;
                 b64 = '';
+            } else if (lastLF === b64.length - 1) {
+                this._curLine = '';
             } else {
                 this._curLine = b64.substring(lastLF + 1);
                 b64 = b64.substring(0, lastLF + 1);
-
-                if (b64 && !b64.endsWith('\r\n')) {
-                    b64 += '\r\n';
-                }
             }
-        } else {
-            this._curLine = '';
         }
 
         if (b64) {
@@ -5149,6 +5158,7 @@ class Encoder extends Transform {
         }
 
         if (this._curLine) {
+            this._curLine = wrap(this._curLine, this.options.lineLength);
             this.outputBytes += this._curLine.length;
             this.push(Buffer.from(this._curLine, 'ascii'));
             this._curLine = '';
@@ -6682,7 +6692,7 @@ class MailComposer {
      * @returns {Object} An object of arrays (`related` and `attached`)
      */
     getAttachments(findRelated) {
-        let icalEvent, eventObject;
+        let eventObject;
         const attachments = [].concat(this.mail.attachments || []).map((attachment, i) => {
             if (/^data:/i.test(attachment.path || attachment.href)) {
                 attachment = this._processDataUrl(attachment);
@@ -6759,18 +6769,7 @@ class MailComposer {
         });
 
         if (this.mail.icalEvent) {
-            if (
-                typeof this.mail.icalEvent === 'object' &&
-                (this.mail.icalEvent.content || this.mail.icalEvent.path || this.mail.icalEvent.href || this.mail.icalEvent.raw)
-            ) {
-                icalEvent = this.mail.icalEvent;
-            } else {
-                icalEvent = {
-                    content: this.mail.icalEvent
-                };
-            }
-
-            eventObject = Object.assign({}, icalEvent);
+            eventObject = Object.assign({}, this._getIcalEvent());
 
             eventObject.contentType = 'application/ics';
             if (!eventObject.headers) {
@@ -6795,13 +6794,74 @@ class MailComposer {
     }
 
     /**
+     * Returns the icalEvent value with `path`/`href`/data uri input normalized into
+     * a `content` entry, the same way as for regular attachments. The same event is
+     * included twice (as a text/calendar alternative and as an application/ics
+     * attachment), so the shared content object is marked to be resolved just once
+     * and the buffered result is reused by the second node.
+     *
+     * @returns {Object} Normalized icalEvent data
+     */
+    _getIcalEvent() {
+        if (!this._icalEvent) {
+            let icalEvent;
+            if (
+                typeof this.mail.icalEvent === 'object' &&
+                (this.mail.icalEvent.content || this.mail.icalEvent.path || this.mail.icalEvent.href || this.mail.icalEvent.raw)
+            ) {
+                icalEvent = Object.assign({}, this.mail.icalEvent);
+            } else {
+                icalEvent = {
+                    content: this.mail.icalEvent
+                };
+            }
+
+            if (/^data:/i.test(icalEvent.path || icalEvent.href)) {
+                icalEvent = this._processDataUrl(icalEvent);
+            }
+
+            if (/^https?:\/\//i.test(icalEvent.path)) {
+                icalEvent.href = icalEvent.path;
+                icalEvent.path = undefined;
+            }
+
+            if (!icalEvent.raw) {
+                // map file path and URL values into `content`, otherwise the content
+                // nodes would render an empty body
+                if (icalEvent.path) {
+                    icalEvent.content = {
+                        path: icalEvent.path
+                    };
+                    icalEvent.path = undefined;
+                } else if (icalEvent.href) {
+                    icalEvent.content = {
+                        href: icalEvent.href,
+                        httpHeaders: icalEvent.httpHeaders
+                    };
+                    icalEvent.href = undefined;
+                }
+            }
+
+            if (icalEvent.content && typeof icalEvent.content === 'object') {
+                // we are going to have the same attachment twice, so mark this to be
+                // resolved just once
+                icalEvent.content._resolve = true;
+            }
+
+            this._icalEvent = icalEvent;
+        }
+
+        return this._icalEvent;
+    }
+
+    /**
      * List alternatives. Resulting objects can be used as input for MimeNode nodes
      *
      * @returns {Array} An array of alternative elements. Includes the `text` and `html` values as well
      */
     getAlternatives() {
         const alternatives = [];
-        let text, html, watchHtml, amp, icalEvent, eventObject;
+        let text, html, watchHtml, amp, eventObject;
 
         if (this.mail.text) {
             if (
@@ -6847,24 +6907,7 @@ class MailComposer {
 
         // NB! when including attachments with a calendar alternative you might end up in a blank screen on some clients
         if (this.mail.icalEvent) {
-            if (
-                typeof this.mail.icalEvent === 'object' &&
-                (this.mail.icalEvent.content || this.mail.icalEvent.path || this.mail.icalEvent.href || this.mail.icalEvent.raw)
-            ) {
-                icalEvent = this.mail.icalEvent;
-            } else {
-                icalEvent = {
-                    content: this.mail.icalEvent
-                };
-            }
-
-            eventObject = Object.assign({}, icalEvent);
-
-            if (eventObject.content && typeof eventObject.content === 'object') {
-                // we are going to have the same attachment twice, so mark this to be
-                // resolved just once
-                eventObject.content._resolve = true;
-            }
+            eventObject = Object.assign({}, this._getIcalEvent());
 
             eventObject.filename = false;
             eventObject.contentType =
@@ -7613,31 +7656,39 @@ class Mail extends EventEmitter {
         if ((!this.options.attachDataUrls && !mail.data.attachDataUrls) || !mail.data.html) {
             return callback();
         }
-        mail.resolveContent(mail.data, 'html', (err, html) => {
-            if (err) {
-                return callback(err);
+        mail.resolveContent(
+            mail.data,
+            'html',
+            { disableFileAccess: mail.data.disableFileAccess, disableUrlAccess: mail.data.disableUrlAccess },
+            (err, html) => {
+                if (err) {
+                    return callback(err);
+                }
+                let cidCounter = 0;
+                html = (html || '')
+                    .toString()
+                    .replace(
+                        /(<img\b[^<>]{0,1024} src\s{0,20}=[\s"']{0,20})(data:([^;]+);[^"'>\s]+)/gi,
+                        (match, prefix, dataUri, mimeType) => {
+                            const cid = crypto.randomBytes(10).toString('hex') + '@localhost';
+                            if (!mail.data.attachments) {
+                                mail.data.attachments = [];
+                            }
+                            if (!Array.isArray(mail.data.attachments)) {
+                                mail.data.attachments = [].concat(mail.data.attachments || []);
+                            }
+                            mail.data.attachments.push({
+                                path: dataUri,
+                                cid,
+                                filename: 'image-' + ++cidCounter + '.' + mimeTypes.detectExtension(mimeType)
+                            });
+                            return prefix + 'cid:' + cid;
+                        }
+                    );
+                mail.data.html = html;
+                callback();
             }
-            let cidCounter = 0;
-            html = (html || '')
-                .toString()
-                .replace(/(<img\b[^<>]{0,1024} src\s{0,20}=[\s"']{0,20})(data:([^;]+);[^"'>\s]+)/gi, (match, prefix, dataUri, mimeType) => {
-                    const cid = crypto.randomBytes(10).toString('hex') + '@localhost';
-                    if (!mail.data.attachments) {
-                        mail.data.attachments = [];
-                    }
-                    if (!Array.isArray(mail.data.attachments)) {
-                        mail.data.attachments = [].concat(mail.data.attachments || []);
-                    }
-                    mail.data.attachments.push({
-                        path: dataUri,
-                        cid,
-                        filename: 'image-' + ++cidCounter + '.' + mimeTypes.detectExtension(mimeType)
-                    });
-                    return prefix + 'cid:' + cid;
-                });
-            mail.data.html = html;
-            callback();
-        });
+        );
     }
 
     set(key, value) {
@@ -7771,25 +7822,29 @@ class MailMessage {
             if (!args[0] || !args[0][args[1]]) {
                 return resolveNext();
             }
-            shared.resolveContent(...args, (err, value) => {
-                if (err) {
-                    return callback(err);
-                }
+            shared.resolveContent(
+                ...args,
+                { disableFileAccess: this.data.disableFileAccess, disableUrlAccess: this.data.disableUrlAccess },
+                (err, value) => {
+                    if (err) {
+                        return callback(err);
+                    }
 
-                const node = {
-                    content: value
-                };
-                if (args[0][args[1]] && typeof args[0][args[1]] === 'object' && !Buffer.isBuffer(args[0][args[1]])) {
-                    Object.keys(args[0][args[1]]).forEach(key => {
-                        if (!(key in node) && !['content', 'path', 'href', 'raw'].includes(key)) {
-                            node[key] = args[0][args[1]][key];
-                        }
-                    });
-                }
+                    const node = {
+                        content: value
+                    };
+                    if (args[0][args[1]] && typeof args[0][args[1]] === 'object' && !Buffer.isBuffer(args[0][args[1]])) {
+                        Object.keys(args[0][args[1]]).forEach(key => {
+                            if (!(key in node) && !['content', 'path', 'href', 'raw'].includes(key)) {
+                                node[key] = args[0][args[1]][key];
+                            }
+                        });
+                    }
 
-                args[0][args[1]] = node;
-                resolveNext();
-            });
+                    args[0][args[1]] = node;
+                    resolveNext();
+                }
+            );
         };
 
         setImmediate(() => resolveNext());
@@ -7929,18 +7984,24 @@ class MailMessage {
                         if (value && value.url) {
                             if (key.toLowerCase().trim() === 'id') {
                                 // List-ID: "comment" <domain>
-                                let comment = value.comment || '';
+                                // strip CR/LF so a comment can't inject extra header lines
+                                let comment = (value.comment || '').toString().replace(/\r?\n|\r/g, ' ');
                                 if (mimeFuncs.isPlainText(comment)) {
                                     comment = '"' + comment + '"';
                                 } else {
                                     comment = mimeFuncs.encodeWord(comment);
                                 }
 
-                                return (value.comment ? comment + ' ' : '') + this._formatListUrl(value.url).replace(/^<[^:]+\/{,2}/, '');
+                                // List-ID expects a bare domain-like identifier, so strip the
+                                // scheme prefix that _formatListUrl adds or passes through
+                                return (
+                                    (value.comment ? comment + ' ' : '') + this._formatListUrl(value.url).replace(/^<[^:]+:\/{0,2}/, '<')
+                                );
                             }
 
                             // List-*: <http://domain> (comment)
-                            let comment = value.comment || '';
+                            // strip CR/LF so a comment can't inject extra header lines
+                            let comment = (value.comment || '').toString().replace(/\r?\n|\r/g, ' ');
                             if (!mimeFuncs.isPlainText(comment)) {
                                 comment = mimeFuncs.encodeWord(comment);
                             }
@@ -10685,7 +10746,7 @@ module.exports = {
         if (!mimeType) {
             return defaultExtension;
         }
-        const parts = (mimeType || '').toLowerCase().trim().split('/');
+        const parts = mimeType.toLowerCase().trim().split('/');
         const rootType = parts.shift().trim();
         const subType = parts.join('/').trim();
 
@@ -11940,17 +12001,21 @@ class MimeNode {
         let user = address.substr(0, lastAt);
         const domain = address.substr(lastAt + 1);
 
-        // Usernames are not touched and are kept as is even if these include unicode
-        // Domains are punycoded by default
-        // 'jõgeva.ee' will be converted to 'xn--jgeva-dua.ee'
-        // non-unicode domains are left as is
+        // Usernames are not touched and are kept as is even if these include unicode.
+        // Domains are punycoded when the local part is ASCII ('safe@jõgeva.ee' -> 'safe@xn--jgeva-dua.ee').
+        // When the local part contains non-ASCII bytes the address already requires SMTPUTF8,
+        // so the domain is kept (or decoded back) as UTF-8 for symmetry on both sides of '@'.
 
-        let encodedDomain;
+        let encodedDomain = domain;
 
         try {
-            encodedDomain = punycode.toASCII(domain.toLowerCase());
+            if (/[\x80-\uFFFF]/.test(user)) {
+                encodedDomain = punycode.toUnicode(domain.toLowerCase());
+            } else {
+                encodedDomain = punycode.toASCII(domain.toLowerCase());
+            }
         } catch (_err) {
-            // keep as is?
+            // keep domain as supplied
         }
 
         if (user.indexOf(' ') >= 0) {
@@ -12298,12 +12363,22 @@ module.exports.createTestAccount = function (apiUrl, callback) {
         requestHeaders.Authorization = 'Bearer ' + ETHEREAL_API_KEY;
     }
 
-    const req = nmfetch(apiUrl + '/user', {
+    const fetchOptions = {
         contentType: 'application/json',
         method: 'POST',
         headers: requestHeaders,
         body: Buffer.from(JSON.stringify(requestBody))
-    });
+    };
+
+    // Credential-bearing request — opt back into strict cert validation when
+    // the API URL is HTTPS. lib/fetch defaults to rejectUnauthorized:false
+    // for attachment hosts that may be self-signed; the Ethereal API has a
+    // real cert, so the lax default was a free attack surface.
+    if (/^https:/i.test(apiUrl)) {
+        fetchOptions.tls = { rejectUnauthorized: true };
+    }
+
+    const req = nmfetch(apiUrl + '/user', fetchOptions);
 
     req.on('readable', () => {
         let chunk;
@@ -12340,11 +12415,20 @@ module.exports.getTestMessageUrl = function (info) {
     }
 
     const infoProps = new Map();
-    info.response.replace(/\[([^\]]+)\]$/, (m, props) => {
-        props.replace(/\b([A-Z0-9]+)=([^\s]+)/g, (m, key, value) => {
-            infoProps.set(key, value);
-        });
-    });
+
+    // Extract the trailing "[...]" part of the response (no "]" allowed inside)
+    // with linear string scanning; the equivalent regex /\[([^\]]+)\]$/ was
+    // flagged for polynomial backtracking on adversarial server responses
+    const response = info.response.toString();
+    if (response.length > 2 && response.charAt(response.length - 1) === ']') {
+        const open = response.indexOf('[', response.lastIndexOf(']', response.length - 2) + 1);
+        if (open >= 0 && open < response.length - 2) {
+            const props = response.substring(open + 1, response.length - 1);
+            props.replace(/\b([A-Z0-9]+)=([^\s]+)/g, (m, key, value) => {
+                infoProps.set(key, value);
+            });
+        }
+    }
 
     if (infoProps.has('STATUS') && infoProps.has('MSGID')) {
         return (testAccount.web || ETHEREAL_WEB) + '/message/' + infoProps.get('MSGID');
@@ -13072,6 +13156,8 @@ const { spawn } = __nccwpck_require__(2081);
 const packageData = __nccwpck_require__(4129);
 const shared = __nccwpck_require__(2673);
 const errors = __nccwpck_require__(6497);
+const LeWindows = __nccwpck_require__(3304);
+const LeUnix = __nccwpck_require__(9827);
 
 /**
  * Generates a Transport object for Sendmail
@@ -13114,6 +13200,8 @@ class SendmailTransport {
                 this.args = options.args;
             }
         }
+
+        this.winbreak = ['win', 'windows', 'dos', '\r\n'].includes((options.newline || '').toString().toLowerCase());
     }
 
     /**
@@ -13246,7 +13334,15 @@ class SendmailTransport {
             );
 
             const sourceStream = mail.message.createReadStream();
-            sourceStream.once('error', err => {
+            let stream = sourceStream;
+            if (this.options.newline) {
+                // apply the transport-level line ending transform; the message-level
+                // `newline` option is handled by MimeNode in createReadStream()
+                stream = sourceStream.pipe(this.winbreak ? new LeWindows() : new LeUnix());
+                sourceStream.once('error', err => stream.emit('error', err));
+            }
+
+            stream.once('error', err => {
                 this.logger.error(
                     {
                         err,
@@ -13261,7 +13357,7 @@ class SendmailTransport {
                 callback(err);
             });
 
-            sourceStream.pipe(sendmail.stdin);
+            stream.pipe(sendmail.stdin);
         } else {
             const err = new Error('sendmail was not found');
             err.code = errors.ESENDMAIL;
@@ -13284,8 +13380,21 @@ module.exports = SendmailTransport;
 const EventEmitter = __nccwpck_require__(2361);
 const packageData = __nccwpck_require__(4129);
 const shared = __nccwpck_require__(2673);
+const errors = __nccwpck_require__(6497);
 const LeWindows = __nccwpck_require__(3304);
 const MimeNode = __nccwpck_require__(8509);
+
+/**
+ * Tags AWS SDK rejections that carry no `code` property (SDK v3 errors only
+ * have a `name`) with the generic SES transport error code, keeping the
+ * original error object intact
+ */
+function tagSesError(err) {
+    if (err && typeof err === 'object' && !err.code) {
+        err.code = errors.ESES;
+    }
+    return err;
+}
 
 /**
  * Generates a Transport object for AWS SES
@@ -13438,6 +13547,7 @@ class SESTransport extends EventEmitter {
                             });
                         })
                         .catch(err => {
+                            tagSesError(err);
                             this.logger.error(
                                 {
                                     err,
@@ -13469,7 +13579,7 @@ class SESTransport extends EventEmitter {
 
         const cb = err => {
             if (err && !['InvalidParameterValue', 'MessageRejected'].includes(err.code || err.Code || err.name)) {
-                return callback(err);
+                return callback(tagSesError(err));
             }
             return callback(null, true);
         };
@@ -13486,15 +13596,13 @@ class SESTransport extends EventEmitter {
             }
         };
 
-        this.getRegion((err, region) => {
-            if (err || !region) {
-                region = 'us-east-1';
-            }
-
+        // the region value is not used for anything when verifying, but the lookup
+        // exercises the client configuration the same way as send() does
+        this.getRegion(() => {
             const command = new this.ses.SendEmailCommand(sesMessage);
             const sendPromise = this.ses.sesClient.send(command);
 
-            sendPromise.then(data => cb(null, data)).catch(err => cb(err));
+            sendPromise.then(() => cb(null)).catch(err => cb(err));
         });
 
         return promise;
@@ -13518,6 +13626,7 @@ const urllib = __nccwpck_require__(7310);
 const util = __nccwpck_require__(3837);
 const fs = __nccwpck_require__(7147);
 const nmfetch = __nccwpck_require__(9106);
+const errors = __nccwpck_require__(6497);
 const dns = __nccwpck_require__(9523);
 const net = __nccwpck_require__(1808);
 const os = __nccwpck_require__(2037);
@@ -13878,7 +13987,16 @@ module.exports._logFunc = (logger, level, defaults, data, message, ...args) => {
     const entry = Object.assign({}, defaults || {}, data || {});
     delete entry.level;
 
-    logger[level](entry, message, ...args);
+    let logLevel = level;
+    if (typeof logger[logLevel] !== 'function') {
+        // Provided logger does not implement this level. Fall back to a
+        // lower-severity handler instead of throwing.
+        logLevel = ['info', 'debug', 'log', 'trace', 'warn', 'error'].find(name => typeof logger[name] === 'function');
+    }
+
+    if (logLevel) {
+        logger[logLevel](entry, message, ...args);
+    }
 };
 
 /**
@@ -14013,9 +14131,17 @@ module.exports.parseDataURI = uri => {
  *
  * @param {Object} data An object or an Array you want to resolve an element for
  * @param {String|Number} key Property name or an Array index
+ * @param {Object} [options] Optional access policy: { disableFileAccess, disableUrlAccess }
  * @param {Function} callback Callback function with (err, value)
  */
-module.exports.resolveContent = (data, key, callback) => {
+module.exports.resolveContent = (data, key, options, callback) => {
+    // options is optional; support the legacy resolveContent(data, key, callback) signature
+    if (!callback && typeof options === 'function') {
+        callback = options;
+        options = false;
+    }
+    options = options || {};
+
     let promise;
 
     if (!callback) {
@@ -14024,6 +14150,12 @@ module.exports.resolveContent = (data, key, callback) => {
         });
     }
 
+    resolveContentValue(data, key, options, callback);
+
+    return promise;
+};
+
+function resolveContentValue(data, key, options, callback) {
     let content = (data && data[key] && data[key].content) || data[key];
     const encoding = ((typeof data[key] === 'object' && data[key].encoding) || 'utf8')
         .toString()
@@ -14050,15 +14182,26 @@ module.exports.resolveContent = (data, key, callback) => {
                 callback(null, value);
             });
         } else if (/^https?:\/\//i.test(content.path || content.href)) {
+            if (options.disableUrlAccess) {
+                return setImmediate(() => {
+                    const err = new Error('Url access rejected for ' + (content.path || content.href));
+                    err.code = errors.EURLACCESS;
+                    callback(err);
+                });
+            }
             return resolveStream(nmfetch(content.path || content.href), callback);
         } else if (/^data:/i.test(content.path || content.href)) {
             const parsedDataUri = module.exports.parseDataURI(content.path || content.href);
 
-            if (!parsedDataUri || !parsedDataUri.data) {
-                return callback(null, Buffer.from(0));
-            }
-            return callback(null, parsedDataUri.data);
+            return callback(null, parsedDataUri && parsedDataUri.data ? parsedDataUri.data : Buffer.alloc(0));
         } else if (content.path) {
+            if (options.disableFileAccess) {
+                return setImmediate(() => {
+                    const err = new Error('File access rejected for ' + content.path);
+                    err.code = errors.EFILEACCESS;
+                    callback(err);
+                });
+            }
             return resolveStream(fs.createReadStream(content.path), callback);
         }
     }
@@ -14069,9 +14212,7 @@ module.exports.resolveContent = (data, key, callback) => {
 
     // default action, return as is
     setImmediate(() => callback(null, content));
-
-    return promise;
-};
+}
 
 /**
  * Copies properties from source objects to target objects
@@ -14534,9 +14675,9 @@ function decodeServerResponse(str) {
  *  * **requireTLS** - forces the client to use STARTTLS
  *  * **name** - the name of the client server
  *  * **localAddress** - outbound address to bind to (see: http://nodejs.org/api/net.html#net_net_connect_options_connectionlistener)
- *  * **greetingTimeout** - Time to wait in ms until greeting message is received from the server (defaults to 10000)
- *  * **connectionTimeout** - how many milliseconds to wait for the connection to establish
- *  * **socketTimeout** - Time of inactivity until the connection is closed (defaults to 1 hour)
+ *  * **greetingTimeout** - Time to wait in ms until greeting message is received from the server (defaults to 30 seconds)
+ *  * **connectionTimeout** - how many milliseconds to wait for the connection to establish (defaults to 2 minutes)
+ *  * **socketTimeout** - Time of inactivity until the connection is closed (defaults to 10 minutes)
  *  * **dnsTimeout** - Time to wait in ms for the DNS requests to be resolved (defaults to 30 seconds)
  *  * **lmtp** - if true, uses LMTP instead of SMTP protocol
  *  * **logger** - bunyan compatible logger interface
@@ -14693,6 +14834,13 @@ class SMTPConnection extends EventEmitter {
          * @private
          */
         this._closing = false;
+
+        /**
+         * Message DATA stream currently piped to the socket, if any. Tracked so
+         * close() can unpipe it before tearing the socket down.
+         * @private
+         */
+        this._currentDataStream = false;
 
         /**
          * Callbacks for socket's listeners
@@ -14952,6 +15100,17 @@ class SMTPConnection extends EventEmitter {
         );
 
         const socket = (this._socket && this._socket.socket) || this._socket;
+
+        // Detach any in-flight DATA stream from the socket so the source stream
+        // can be garbage-collected once the socket is gone.
+        if (this._currentDataStream) {
+            try {
+                this._currentDataStream.unpipe(this._socket);
+            } catch (_E) {
+                // ignore
+            }
+            this._currentDataStream = false;
+        }
 
         if (socket && !socket.destroyed) {
             try {
@@ -15303,7 +15462,7 @@ class SMTPConnection extends EventEmitter {
             return;
         }
 
-        let data = (chunk || '').toString('binary');
+        let data = chunk.toString('binary');
         let lines = (this._remainder + data).split(/\r?\n/);
         let lastline;
 
@@ -15436,7 +15595,9 @@ class SMTPConnection extends EventEmitter {
      */
     _onEnd() {
         if (this._socket && !this._socket.destroyed) {
-            this._socket.destroy();
+            // Peer sent FIN — finish our half of the close gracefully rather
+            // than destroying. 'close' fires after the OS finalizes teardown.
+            this._socket.end();
         }
     }
 
@@ -15488,6 +15649,15 @@ class SMTPConnection extends EventEmitter {
             opts.servername = this.servername;
         }
 
+        // Remove all listeners from the plain socket to allow proper garbage
+        // collection. Used on both the TLS-success path and the synchronous
+        // tls.connect() throw path; either way the plain socket is done.
+        const removePlainSocketListeners = () => {
+            socketPlain.removeListener('close', this._onSocketClose);
+            socketPlain.removeListener('end', this._onSocketEnd);
+            socketPlain.removeListener('error', this._onSocketError);
+        };
+
         this.upgrading = true;
         // tls.connect is not an asynchronous function however it may still throw errors and requires to be wrapped with try/catch
         try {
@@ -15496,14 +15666,12 @@ class SMTPConnection extends EventEmitter {
                 this.upgrading = false;
                 this._socket.on('data', this._onSocketData);
 
-                // Remove all listeners from the plain socket to allow proper garbage collection
-                socketPlain.removeListener('close', this._onSocketClose);
-                socketPlain.removeListener('end', this._onSocketEnd);
-                socketPlain.removeListener('error', this._onSocketError);
+                removePlainSocketListeners();
 
                 return callback(null, true);
             });
         } catch (err) {
+            removePlainSocketListeners();
             return callback(err);
         }
 
@@ -15780,6 +15948,7 @@ class SMTPConnection extends EventEmitter {
             });
         }
 
+        this._currentDataStream = dataStream;
         dataStream.pipe(this._socket, {
             end: false
         });
@@ -15801,6 +15970,9 @@ class SMTPConnection extends EventEmitter {
         }
 
         dataStream.once('end', () => {
+            if (this._currentDataStream === dataStream) {
+                this._currentDataStream = false;
+            }
             this.logger.info(
                 {
                     tnx: 'message',
@@ -17403,13 +17575,19 @@ class SMTPTransport extends EventEmitter {
 
     getAuth(authOpts) {
         if (!authOpts) {
+            if (this.auth && this.auth.oauth2 && this.mailer) {
+                // Transport-level auth is resolved in the constructor, before the Mail wrapper
+                // assigns `this.mailer`, so a provision callback registered with
+                // `transporter.set('oauth2_provision_cb', ...)` has to be re-checked here
+                this.auth.oauth2.provisionCallback = this.mailer.get('oauth2_provision_cb') || this.auth.oauth2.provisionCallback;
+            }
             return this.auth;
         }
 
         const authData = Object.assign(
             {},
             this.options.auth && typeof this.options.auth === 'object' ? this.options.auth : {},
-            authOpts && typeof authOpts === 'object' ? authOpts : {}
+            typeof authOpts === 'object' ? authOpts : {}
         );
 
         if (Object.keys(authData).length === 0) {
@@ -17483,11 +17661,20 @@ class SMTPTransport extends EventEmitter {
 
             const connection = new SMTPConnection(options);
 
+            let perCallAuth;
+            const cleanupPerCallAuth = () => {
+                if (perCallAuth && perCallAuth !== this.auth && perCallAuth.oauth2) {
+                    perCallAuth.oauth2.removeAllListeners();
+                }
+                perCallAuth = null;
+            };
+
             connection.once('error', err => {
                 if (returned) {
                     return;
                 }
                 returned = true;
+                cleanupPerCallAuth();
                 connection.close();
                 return callback(err);
             });
@@ -17502,6 +17689,7 @@ class SMTPTransport extends EventEmitter {
                         return;
                     }
                     returned = true;
+                    cleanupPerCallAuth();
                     // still have not returned, this means we have an unexpected connection close
                     const err = new Error('Unexpected socket close');
                     if (connection && connection._socket && connection._socket.upgrading) {
@@ -17548,6 +17736,7 @@ class SMTPTransport extends EventEmitter {
 
                 connection.send(envelope, mail.message.createReadStream(), (err, info) => {
                     returned = true;
+                    cleanupPerCallAuth();
                     connection.close();
                     if (err) {
                         this.logger.error(
@@ -17587,13 +17776,11 @@ class SMTPTransport extends EventEmitter {
                     return;
                 }
 
-                const auth = this.getAuth(mail.data.auth);
+                perCallAuth = this.getAuth(mail.data.auth);
 
-                if (auth && (connection.allowsAuth || options.forceAuth)) {
-                    connection.login(auth, err => {
-                        if (auth && auth !== this.auth && auth.oauth2) {
-                            auth.oauth2.removeAllListeners();
-                        }
+                if (perCallAuth && (connection.allowsAuth || options.forceAuth)) {
+                    connection.login(perCallAuth, err => {
+                        cleanupPerCallAuth();
                         if (returned) {
                             return;
                         }
@@ -17655,12 +17842,20 @@ class SMTPTransport extends EventEmitter {
 
             const connection = new SMTPConnection(options);
             let returned = false;
+            let perCallAuth;
+            const cleanupPerCallAuth = () => {
+                if (perCallAuth && perCallAuth !== this.auth && perCallAuth.oauth2) {
+                    perCallAuth.oauth2.removeAllListeners();
+                }
+                perCallAuth = null;
+            };
 
             connection.once('error', err => {
                 if (returned) {
                     return;
                 }
                 returned = true;
+                cleanupPerCallAuth();
                 connection.close();
                 return callback(err);
             });
@@ -17670,6 +17865,7 @@ class SMTPTransport extends EventEmitter {
                     return;
                 }
                 returned = true;
+                cleanupPerCallAuth();
                 return callback(new Error('Connection closed'));
             });
 
@@ -17678,6 +17874,7 @@ class SMTPTransport extends EventEmitter {
                     return;
                 }
                 returned = true;
+                cleanupPerCallAuth();
                 connection.quit();
                 return callback(null, true);
             };
@@ -17687,10 +17884,11 @@ class SMTPTransport extends EventEmitter {
                     return;
                 }
 
-                const authData = this.getAuth({});
+                perCallAuth = this.getAuth({});
 
-                if (authData && (connection.allowsAuth || options.forceAuth)) {
-                    connection.login(authData, err => {
+                if (perCallAuth && (connection.allowsAuth || options.forceAuth)) {
+                    connection.login(perCallAuth, err => {
+                        cleanupPerCallAuth();
                         if (returned) {
                             return;
                         }
@@ -17703,11 +17901,12 @@ class SMTPTransport extends EventEmitter {
 
                         finalize();
                     });
-                } else if (!authData && connection.allowsAuth && options.forceAuth) {
+                } else if (!perCallAuth && connection.allowsAuth && options.forceAuth) {
                     const err = new Error('Authentication info was not provided');
                     err.code = errors.ENOAUTH;
 
                     returned = true;
+                    cleanupPerCallAuth();
                     connection.close();
                     return callback(err);
                 } else {
@@ -17744,6 +17943,8 @@ module.exports = SMTPTransport;
 
 const packageData = __nccwpck_require__(4129);
 const shared = __nccwpck_require__(2673);
+const LeWindows = __nccwpck_require__(3304);
+const LeUnix = __nccwpck_require__(9827);
 
 /**
  * Generates a Transport object for streaming
@@ -17805,6 +18006,13 @@ class StreamTransport {
 
             try {
                 stream = mail.message.createReadStream();
+                if (this.options.newline) {
+                    // apply the transport-level line ending transform; the message-level
+                    // `newline` option is handled by MimeNode in createReadStream()
+                    const sourceStream = stream;
+                    stream = sourceStream.pipe(this.winbreak ? new LeWindows() : new LeUnix());
+                    sourceStream.once('error', err => stream.emit('error', err));
+                }
             } catch (E) {
                 this.logger.error(
                     {
@@ -17973,6 +18181,7 @@ const errors = __nccwpck_require__(6497);
  * @param {Number} options.expires Optional Access Token expire time in ms
  * @param {Number} options.timeout Optional TTL for Access Token in seconds
  * @param {Function} options.provisionCallback Function to run when a new access token is required
+ * @param {Object} options.tls Optional TLS options forwarded to the HTTPS token request. Defaults to strict cert validation; supply { rejectUnauthorized: false } only for self-hosted OAuth providers on private CAs.
  */
 class XOAuth2 extends Stream {
     constructor(options, logger) {
@@ -18310,12 +18519,24 @@ class XOAuth2 extends Stream {
         const chunks = [];
         let chunklen = 0;
 
-        const req = nmfetch(url, {
+        const fetchOptions = {
             method: 'post',
             headers: params.customHeaders,
             body: payload,
             allowErrorResponse: true
-        });
+        };
+
+        // OAuth2 token endpoints are credential-bearing. lib/fetch defaults to
+        // rejectUnauthorized:false (intentional for self-signed attachment
+        // hosts), so opt back in to strict cert validation here when the
+        // access URL is HTTPS. params.tls (the user's options.tls) is layered
+        // on top so callers with a self-hosted provider on a private CA can
+        // still override.
+        if (/^https:/i.test(url)) {
+            fetchOptions.tls = Object.assign({ rejectUnauthorized: true }, params.tls || {});
+        }
+
+        const req = nmfetch(url, fetchOptions);
 
         req.on('readable', () => {
             let chunk;
@@ -27921,7 +28142,6 @@ function defaultFactory (origin, opts) {
 
 class Agent extends DispatcherBase {
   constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
-
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -28309,6 +28529,9 @@ const EMPTY_BUF = Buffer.alloc(0)
 const FastBuffer = Buffer[Symbol.species]
 const addListener = util.addListener
 const removeAllListeners = util.removeAllListeners
+const kIdleSocketValidation = Symbol('kIdleSocketValidation')
+const kIdleSocketValidationTimeout = Symbol('kIdleSocketValidationTimeout')
+const kSocketUsed = Symbol('kSocketUsed')
 
 let extractBody
 
@@ -28531,27 +28754,69 @@ class Parser {
 
       const offset = llhttp.llhttp_get_error_pos(this.ptr) - currentBufferPtr
 
-      if (ret === constants.ERROR.PAUSED_UPGRADE) {
-        this.onUpgrade(data.slice(offset))
-      } else if (ret === constants.ERROR.PAUSED) {
-        this.paused = true
-        socket.unshift(data.slice(offset))
-      } else if (ret !== constants.ERROR.OK) {
-        const ptr = llhttp.llhttp_get_error_reason(this.ptr)
-        let message = ''
-        /* istanbul ignore else: difficult to make a test case for */
-        if (ptr) {
-          const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
-          message =
-            'Response does not match the HTTP/1.1 protocol (' +
-            Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
-            ')'
+      if (ret !== constants.ERROR.OK) {
+        const body = data.subarray(offset)
+
+        if (ret === constants.ERROR.PAUSED_UPGRADE) {
+          this.onUpgrade(body)
+        } else if (ret === constants.ERROR.PAUSED) {
+          this.paused = true
+          socket.unshift(body)
+        } else {
+          throw this.createError(ret, body)
         }
-        throw new HTTPParserError(message, constants.ERROR[ret], data.slice(offset))
       }
     } catch (err) {
       util.destroy(socket, err)
     }
+  }
+
+  finish () {
+    assert(currentParser === null)
+    assert(this.ptr != null)
+    assert(!this.paused)
+
+    const { llhttp } = this
+
+    let ret
+
+    try {
+      currentParser = this
+      ret = llhttp.llhttp_finish(this.ptr)
+    } finally {
+      currentParser = null
+    }
+
+    if (ret === constants.ERROR.OK) {
+      return null
+    }
+
+    if (ret === constants.ERROR.PAUSED || ret === constants.ERROR.PAUSED_UPGRADE) {
+      this.paused = true
+      return null
+    }
+
+    return this.createError(ret, EMPTY_BUF)
+  }
+
+  createError (ret, data) {
+    const { llhttp, contentLength, bytesRead } = this
+
+    if (contentLength && bytesRead !== parseInt(contentLength, 10)) {
+      return new ResponseContentLengthMismatchError()
+    }
+
+    const ptr = llhttp.llhttp_get_error_reason(this.ptr)
+    let message = ''
+    if (ptr) {
+      const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
+      message =
+        'Response does not match the HTTP/1.1 protocol (' +
+        Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
+        ')'
+    }
+
+    return new HTTPParserError(message, constants.ERROR[ret], data)
   }
 
   destroy () {
@@ -28578,6 +28843,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -28681,6 +28951,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -28857,6 +29132,7 @@ class Parser {
     request.onComplete(headers)
 
     client[kQueue][client[kRunningIdx]++] = null
+    socket[kSocketUsed] = true
 
     if (socket[kWriting]) {
       assert(client[kRunning] === 0)
@@ -28915,6 +29191,9 @@ async function connectH1 (client, socket) {
   socket[kWriting] = false
   socket[kReset] = false
   socket[kBlocking] = false
+  socket[kIdleSocketValidation] = 0
+  socket[kIdleSocketValidationTimeout] = null
+  socket[kSocketUsed] = false
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
@@ -28925,8 +29204,11 @@ async function connectH1 (client, socket) {
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
     // to the user.
     if (err.code === 'ECONNRESET' && parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so for as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        this[kError] = parserErr
+        this[kClient][kOnError](parserErr)
+      }
       return
     }
 
@@ -28945,8 +29227,10 @@ async function connectH1 (client, socket) {
     const parser = this[kParser]
 
     if (parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so far as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        util.destroy(this, parserErr)
+      }
       return
     }
 
@@ -28956,10 +29240,11 @@ async function connectH1 (client, socket) {
     const client = this[kClient]
     const parser = this[kParser]
 
+    clearIdleSocketValidation(this)
+
     if (parser) {
       if (!this[kError] && parser.statusCode && !parser.shouldKeepAlive) {
-        // We treat all incoming data so far as a valid response.
-        parser.onMessageComplete()
+        this[kError] = parser.finish() || this[kError]
       }
 
       this[kParser].destroy()
@@ -29022,7 +29307,7 @@ async function connectH1 (client, socket) {
       return socket.destroyed
     },
     busy (request) {
-      if (socket[kWriting] || socket[kReset] || socket[kBlocking]) {
+      if (socket[kWriting] || socket[kReset] || socket[kBlocking] || socket[kIdleSocketValidation] === 1) {
         return true
       }
 
@@ -29060,6 +29345,31 @@ async function connectH1 (client, socket) {
   }
 }
 
+function clearIdleSocketValidation (socket) {
+  if (socket[kIdleSocketValidationTimeout]) {
+    clearTimeout(socket[kIdleSocketValidationTimeout])
+    socket[kIdleSocketValidationTimeout] = null
+  }
+
+  socket[kIdleSocketValidation] = 0
+}
+
+function scheduleIdleSocketValidation (client, socket) {
+  socket[kIdleSocketValidation] = 1
+  socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+    socket[kIdleSocketValidationTimeout] = null
+    socket[kIdleSocketValidation] = 2
+
+    if (client[kSocket] === socket && !socket.destroyed) {
+      client[kResume]()
+    }
+  }, 0)
+  socket[kIdleSocketValidationTimeout].unref?.()
+}
+
+/**
+ * @param {import('./client.js')} client
+ */
 function resumeH1 (client) {
   const socket = client[kSocket]
 
@@ -29072,6 +29382,32 @@ function resumeH1 (client) {
     } else if (socket[kNoRef] && socket.ref) {
       socket.ref()
       socket[kNoRef] = false
+    }
+
+    if (client[kRunning] === 0 && client[kPending] > 0 && socket[kSocketUsed]) {
+      if (socket[kIdleSocketValidation] === 0) {
+        scheduleIdleSocketValidation(client, socket)
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+
+      if (socket[kIdleSocketValidation] === 1) {
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+    }
+
+    if (client[kRunning] === 0) {
+      socket[kParser].readMore()
+      if (socket.destroyed) {
+        return
+      }
     }
 
     if (client[kSize] === 0) {
@@ -29167,6 +29503,7 @@ function writeH1 (client, request) {
   }
 
   const socket = client[kSocket]
+  clearIdleSocketValidation(socket)
 
   const abort = (err) => {
     if (request.aborted || request.completed) {
@@ -31039,6 +31376,7 @@ class DispatcherBase extends Dispatcher {
 
   get webSocketOptions () {
     return {
+      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
       maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
     }
   }
@@ -36975,32 +37313,25 @@ function parseUnparsedAttributes (unparsedAttributes, cookieAttributeList = {}) 
     // If the attribute-name case-insensitively matches the string
     // "SameSite", the user agent MUST process the cookie-av as follows:
 
-    // 1. Let enforcement be "Default".
-    let enforcement = 'Default'
-
     const attributeValueLowercase = attributeValue.toLowerCase()
-    // 2. If cookie-av's attribute-value is a case-insensitive match for
-    //    "None", set enforcement to "None".
-    if (attributeValueLowercase.includes('none')) {
-      enforcement = 'None'
-    }
 
-    // 3. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Strict", set enforcement to "Strict".
-    if (attributeValueLowercase.includes('strict')) {
-      enforcement = 'Strict'
+    // 1. If cookie-av's attribute-value is a case-insensitive match for
+    //    "None", append an attribute to the cookie-attribute-list with an
+    //    attribute-name of "SameSite" and an attribute-value of "None".
+    if (attributeValueLowercase === 'none') {
+      cookieAttributeList.sameSite = 'None'
+    } else if (attributeValueLowercase === 'strict') {
+      // 2. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Strict", append an attribute to the cookie-attribute-list with
+      //    an attribute-name of "SameSite" and an attribute-value of
+      //    "Strict".
+      cookieAttributeList.sameSite = 'Strict'
+    } else if (attributeValueLowercase === 'lax') {
+      // 3. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Lax", append an attribute to the cookie-attribute-list with an
+      //    attribute-name of "SameSite" and an attribute-value of "Lax".
+      cookieAttributeList.sameSite = 'Lax'
     }
-
-    // 4. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Lax", set enforcement to "Lax".
-    if (attributeValueLowercase.includes('lax')) {
-      enforcement = 'Lax'
-    }
-
-    // 5. Append an attribute to the cookie-attribute-list with an
-    //    attribute-name of "SameSite" and an attribute-value of
-    //    enforcement.
-    cookieAttributeList.sameSite = enforcement
   } else {
     cookieAttributeList.unparsed ??= []
 
@@ -49826,6 +50157,11 @@ const { closeWebSocketConnection } = __nccwpck_require__(8380)
 const { PerMessageDeflate } = __nccwpck_require__(8236)
 const { MessageSizeExceededError } = __nccwpck_require__(8045)
 
+function failWebsocketConnectionWithCode (ws, code, reason) {
+  closeWebSocketConnection(ws, code, reason, Buffer.byteLength(reason))
+  failWebsocketConnection(ws, reason)
+}
+
 // This code was influenced by ws released under the MIT license.
 // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
 // Copyright (c) 2013 Arnout Kazemier and contributors
@@ -49846,18 +50182,22 @@ class ByteParser extends Writable {
   #extensions
 
   /** @type {number} */
+  #maxFragments
+
+  /** @type {number} */
   #maxPayloadSize
 
   /**
    * @param {import('./websocket').WebSocket} ws
    * @param {Map<string, string>|null} extensions
-   * @param {{ maxPayloadSize?: number }} [options]
+   * @param {{ maxFragments?: number, maxPayloadSize?: number }} [options]
    */
   constructor (ws, extensions, options = {}) {
     super()
 
     this.ws = ws
     this.#extensions = extensions == null ? new Map() : extensions
+    this.#maxFragments = options.maxFragments ?? 0
     this.#maxPayloadSize = options.maxPayloadSize ?? 0
 
     if (this.#extensions.has('permessage-deflate')) {
@@ -49881,9 +50221,9 @@ class ByteParser extends Writable {
     if (
       this.#maxPayloadSize > 0 &&
       !isControlFrame(this.#info.opcode) &&
-      this.#info.payloadLength > this.#maxPayloadSize
+      this.#info.payloadLength + this.#fragmentsBytes > this.#maxPayloadSize
     ) {
-      failWebsocketConnection(this.ws, 'Payload size exceeds maximum allowed size')
+      failWebsocketConnectionWithCode(this.ws, 1009, 'Payload size exceeds maximum allowed size')
       return false
     }
 
@@ -50048,10 +50388,12 @@ class ByteParser extends Writable {
           this.#state = parserStates.INFO
         } else {
           if (!this.#info.compressed) {
-            this.writeFragments(body)
+            if (!this.writeFragments(body)) {
+              return
+            }
 
             if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-              failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+              failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
               return
             }
 
@@ -50070,14 +50412,17 @@ class ByteParser extends Writable {
               this.#info.fin,
               (error, data) => {
                 if (error) {
-                  failWebsocketConnection(this.ws, error.message)
+                  const code = error instanceof MessageSizeExceededError ? 1009 : 1007
+                  failWebsocketConnectionWithCode(this.ws, code, error.message)
                   return
                 }
 
-                this.writeFragments(data)
+                if (!this.writeFragments(data)) {
+                  return
+                }
 
                 if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-                  failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+                  failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
                   return
                 }
 
@@ -50147,8 +50492,17 @@ class ByteParser extends Writable {
   }
 
   writeFragments (fragment) {
+    if (
+      this.#maxFragments > 0 &&
+      this.#fragments.length === this.#maxFragments
+    ) {
+      failWebsocketConnectionWithCode(this.ws, 1008, 'Too many message fragments')
+      return false
+    }
+
     this.#fragmentsBytes += fragment.length
     this.#fragments.push(fragment)
+    return true
   }
 
   consumeFragments () {
@@ -51201,9 +51555,12 @@ class WebSocket extends EventTarget {
     // once this happens, the connection is open
     this[kResponse] = response
 
-    const maxPayloadSize = this[kController]?.dispatcher?.webSocketOptions?.maxPayloadSize
+    const webSocketOptions = this[kController]?.dispatcher?.webSocketOptions
+    const maxFragments = webSocketOptions?.maxFragments
+    const maxPayloadSize = webSocketOptions?.maxPayloadSize
 
     const parser = new ByteParser(this, parsedExtensions, {
+      maxFragments,
       maxPayloadSize
     })
     parser.on('drain', onParserDrain)
@@ -51684,7 +52041,7 @@ module.exports = JSON.parse('{"126":{"description":"126 Mail (NetEase)","host":"
 /***/ ((module) => {
 
 "use strict";
-module.exports = JSON.parse('{"name":"nodemailer","version":"8.0.5","description":"Easy as cake e-mail sending from your Node.js applications","main":"lib/nodemailer.js","scripts":{"test":"node --test --test-concurrency=1 test/**/*.test.js test/**/*-test.js","test:coverage":"c8 node --test --test-concurrency=1 test/**/*.test.js test/**/*-test.js","format":"prettier --write \\"**/*.{js,json,md}\\"","format:check":"prettier --check \\"**/*.{js,json,md}\\"","lint":"eslint .","lint:fix":"eslint . --fix","update":"rm -rf node_modules/ package-lock.json && ncu -u && npm install","test:syntax":"docker run --rm -v \\"$PWD:/app:ro\\" -w /app node:6-alpine node test/syntax-compat.js"},"repository":{"type":"git","url":"https://github.com/nodemailer/nodemailer.git"},"keywords":["Nodemailer"],"author":"Andris Reinman","license":"MIT-0","bugs":{"url":"https://github.com/nodemailer/nodemailer/issues"},"homepage":"https://nodemailer.com/","devDependencies":{"@aws-sdk/client-sesv2":"3.1025.0","bunyan":"1.8.15","c8":"11.0.0","eslint":"10.2.0","eslint-config-prettier":"10.1.8","globals":"17.4.0","libbase64":"1.3.0","libmime":"5.3.7","libqp":"2.1.1","nodemailer-ntlm-auth":"1.0.4","prettier":"3.8.1","proxy":"1.0.2","proxy-test-server":"1.0.0","smtp-server":"3.18.3"},"engines":{"node":">=6.0.0"}}');
+module.exports = JSON.parse('{"name":"nodemailer","version":"8.0.11","description":"Easy as cake e-mail sending from your Node.js applications","main":"lib/nodemailer.js","scripts":{"test":"node --test --test-concurrency=1 $(find test \\\\( -name \'*-test.js\' -o -name \'*.test.js\' \\\\))","test:coverage":"c8 node --test --test-concurrency=1 $(find test \\\\( -name \'*-test.js\' -o -name \'*.test.js\' \\\\))","format":"prettier --write \\"**/*.{js,json,md}\\"","format:check":"prettier --check \\"**/*.{js,json,md}\\"","lint":"eslint .","lint:fix":"eslint . --fix","update":"rm -rf node_modules/ package-lock.json && ncu -u && npm install","test:syntax":"docker run --rm -v \\"$PWD:/app:ro\\" -w /app node:6-alpine node test/syntax-compat.js"},"repository":{"type":"git","url":"https://github.com/nodemailer/nodemailer.git"},"keywords":["Nodemailer"],"author":"Andris Reinman","license":"MIT-0","bugs":{"url":"https://github.com/nodemailer/nodemailer/issues"},"homepage":"https://nodemailer.com/","devDependencies":{"@aws-sdk/client-sesv2":"3.1065.0","bunyan":"1.8.15","c8":"11.0.0","eslint":"10.4.1","eslint-config-prettier":"10.1.8","globals":"17.6.0","libbase64":"1.3.0","libmime":"5.3.8","libqp":"2.1.1","prettier":"3.8.4","proxy":"1.0.2","proxy-test-server":"1.0.0","smtp-server":"3.18.5"},"engines":{"node":">=6.0.0"}}');
 
 /***/ })
 
