@@ -1,3 +1,7 @@
 [[IgnoredVulns]]
 id = "GHSA-8hc4-vh64-cxmj"
 reason = "Axios URL is not user-controlled"
+
+[[IgnoredVulns]]
+id = "GHSA-rmmh-p597-ppvv"
+reason = "XSS in showdown does not apply: markdown input is action-operator-controlled and output is an email body, not a web page."
