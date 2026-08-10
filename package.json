@@ -20,7 +20,7 @@
     "axios": "^1.6.2",
     "@actions/glob": "^0.7.0",
     "nodemailer": "^9.0.1",
-    "@vercel/ncc": "^0.38.1",
+    "@vercel/ncc": "^0.44.1",
     "showdown": "^2.1.0"
   }
 }
