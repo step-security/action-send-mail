@@ -144,6 +144,7 @@ async function main() {
         let serverAddress = core.getInput("server_address");
         let serverPort = core.getInput("server_port");
         let secure = core.getInput("secure");
+        const requireTLS = core.getInput("require_tls", { required: false });
         let username = core.getInput("username");
         let password = core.getInput("password");
 
@@ -246,6 +247,7 @@ async function main() {
                     : undefined,
             port: serverPort,
             secure: secure === "true",
+            requireTLS: requireTLS === "true",
             tls:
                 ignoreCert == "true"
                     ? {
