@@ -7,6 +7,22 @@ import showdown from "showdown";
 import path from "node:path";
 import axios from "axios";
 
+// smtp_proxy or smtps_proxy, exempted by no_proxy, each preferred lowercase like curl.
+function getProxy(host) {
+    const env = (name) => process.env[name] || process.env[name.toUpperCase()];
+
+    const proxy = env("smtp_proxy") || env("smtps_proxy");
+    if (!proxy) return undefined;
+
+    host = `.${host.toLowerCase()}`;
+    const excluded = (env("no_proxy") || "")
+        .split(",")
+        .map((entry) => entry.trim().replace(/^\./, "").toLowerCase())
+        .some((entry) => entry && (entry === "*" || host.endsWith(`.${entry}`)));
+
+    return excluded ? undefined : proxy;
+}
+
 function getText(textOrFile, convertMarkdown) {
     let text = textOrFile;
 
@@ -128,6 +144,7 @@ async function main() {
         let serverAddress = core.getInput("server_address");
         let serverPort = core.getInput("server_port");
         let secure = core.getInput("secure");
+        const requireTLS = core.getInput("require_tls", { required: false });
         let username = core.getInput("username");
         let password = core.getInput("password");
 
@@ -230,6 +247,7 @@ async function main() {
                     : undefined,
             port: serverPort,
             secure: secure === "true",
+            requireTLS: requireTLS === "true",
             tls:
                 ignoreCert == "true"
                     ? {
@@ -238,7 +256,7 @@ async function main() {
                     : undefined,
             logger: nodemailerdebug == "true" ? true : nodemailerlog,
             debug: nodemailerdebug,
-            proxy: process.env.HTTP_PROXY,
+            proxy: getProxy(serverAddress),
         });
 
         const messageOptions = {

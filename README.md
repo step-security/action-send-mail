@@ -18,8 +18,8 @@ Some features:
 - name: Send mail
   uses: step-security/action-send-mail@v6
   env:
-    # Optional http proxy:
-    HTTP_PROXY: http://proxy.example.test:3128
+    # Optional proxy, NO_PROXY is honored too:
+    SMTP_PROXY: http://proxy.example.test:3128
   with:
     # Specify connection via URL (replaces server_address, server_port, secure,
     # username and password)
@@ -38,6 +38,12 @@ Some features:
 
     # Optional whether this connection use TLS (default is true if server_port is 465)
     secure: true
+
+    # Optional: when secure is false (e.g. STARTTLS on port 587), abort the
+    # connection if the server does not support/negotiate STARTTLS, instead
+    # of silently falling back to a plain text connection. Recommended
+    # whenever secure is false and you authenticate with username/password.
+    require_tls: true
 
     # Optional (recommended) mail server username:
     username: ${{secrets.MAIL_USERNAME}}
