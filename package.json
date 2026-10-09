@@ -19,7 +19,7 @@
     "@actions/core": "^3.0.1",
     "axios": "^1.20.0",
     "@actions/glob": "^0.7.0",
-    "nodemailer": "^10.0.8",
+    "nodemailer": "^10.0.15",
     "@vercel/ncc": "^0.38.1",
     "showdown": "^2.1.0"
   }
