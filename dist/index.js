@@ -2476,6 +2476,15 @@ RedirectableRequest.prototype._sanitizeOptions = function (options) {
   if (!options.headers) {
     options.headers = {};
   }
+  // Convert [header1, value1, header2, value2, …] to object
+  else if (Array.isArray(options.headers)) {
+    var headerList = options.headers;
+    options.headers = {};
+    for (var i = 0; i < headerList.length; i += 2) {
+      options.headers[headerList[i]] = headerList[i + 1];
+    }
+  }
+  // Ensure sensitive headers are always present
   if (!isArray(options.sensitiveHeaders)) {
     options.sensitiveHeaders = [];
   }
@@ -2875,7 +2884,7 @@ function isURL(value) {
 }
 
 function escapeRegex(regex) {
-  return regex.replace(/[\]\\/()*+?.$]/g, "\\$&");
+  return regex.replace(/[[\]\\/()*+?.^$|]/g, "\\$&");
 }
 
 // Exports
@@ -14511,7 +14520,7 @@ function defaultFactory (origin, opts) {
 }
 
 class Agent extends DispatcherBase {
-  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
+  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, tls, ...options } = {}) {
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -14530,11 +14539,15 @@ class Agent extends DispatcherBase {
       connect = { ...connect }
     }
 
+    if (tls && typeof tls !== 'function') {
+      tls = { ...tls }
+    }
+
     this[kInterceptors] = options.interceptors?.Agent && Array.isArray(options.interceptors.Agent)
       ? options.interceptors.Agent
       : [createRedirectInterceptor({ maxRedirections })]
 
-    this[kOptions] = { ...util.deepClone(options), connect }
+    this[kOptions] = { ...util.deepClone(options), connect, tls }
     this[kOptions].interceptors = options.interceptors
       ? { ...options.interceptors }
       : undefined
@@ -15569,8 +15582,6 @@ async function connectH1 (client, socket) {
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     const parser = this[kParser]
 
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
@@ -16501,8 +16512,6 @@ async function connectH2 (client, socket) {
   socket[kHTTP2Session] = session
 
   util.addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     this[kError] = err
 
     this[kClient][kOnError](err)
@@ -16576,8 +16585,6 @@ function resumeH2 (client) {
 }
 
 function onHttp2SessionError (err) {
-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
   this[kSocket][kError] = err
   this[kClient][kOnError](err)
 }
@@ -17276,9 +17283,10 @@ class Client extends DispatcherBase {
     // h2
     maxConcurrentStreams,
     allowH2,
-    webSocket
+    webSocket,
+    eventSource
   } = {}) {
-    super({ webSocket })
+    super({ webSocket, eventSource })
 
     if (keepAlive !== undefined) {
       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -17800,6 +17808,7 @@ module.exports = Client
 "use strict";
 
 
+const buffer = __nccwpck_require__(4573)
 const Dispatcher = __nccwpck_require__(883)
 const {
   ClientDestroyedError,
@@ -17812,6 +17821,7 @@ const kOnDestroyed = Symbol('onDestroyed')
 const kOnClosed = Symbol('onClosed')
 const kInterceptedDispatch = Symbol('Intercepted Dispatch')
 const kWebSocketOptions = Symbol('webSocketOptions')
+const kEventSourceOptions = Symbol('eventSourceOptions')
 
 class DispatcherBase extends Dispatcher {
   constructor (opts) {
@@ -17822,12 +17832,19 @@ class DispatcherBase extends Dispatcher {
     this[kClosed] = false
     this[kOnClosed] = []
     this[kWebSocketOptions] = opts?.webSocket ?? {}
+    this[kEventSourceOptions] = opts?.eventSource ?? {}
   }
 
   get webSocketOptions () {
     return {
       maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
       maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
+    }
+  }
+
+  get eventSourceOptions () {
+    return {
+      maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
     }
   }
 
@@ -24228,6 +24245,7 @@ module.exports = {
 
 "use strict";
 
+const buffer = __nccwpck_require__(4573)
 const { Transform } = __nccwpck_require__(7075)
 const { isASCIINumber, isValidLastEventId } = __nccwpck_require__(4811)
 
@@ -24252,10 +24270,18 @@ const COLON = 0x3A
  */
 const SPACE = 0x20
 
+const defaultMaxEventSize = buffer.kStringMaxLength
+
 const DATA = Buffer.from('data')
 const EVENT = Buffer.from('event')
 const ID = Buffer.from('id')
 const RETRY = Buffer.from('retry')
+
+// Each data field creates a string node, and each unconsumed input chunk keeps
+// a Buffer wrapper. The absolute ceiling protects the large default byte limit.
+const minParserItems = 1024
+const maxParserItems = 131072
+const bytesPerParserItem = 128
 
 function isASCIINumberBytes (buffer, start) {
   if (start >= buffer.length) {
@@ -24293,6 +24319,12 @@ function isFieldName (line, length, field) {
   }
 
   return true
+}
+
+function createMaxEventSizeExceededError () {
+  const error = new Error('EventSource message size exceeded')
+  error.aborted = false
+  return error
 }
 
 /**
@@ -24343,6 +24375,13 @@ class EventSourceStream extends Transform {
   pos = 0
   lineChunkIndex = 0
   linePos = 0
+  lineLength = 0
+  eventSize = 0
+  eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
+  dataLineCount = 0
+  maxEventSize
+  maxDataLines
+  maxBufferedChunks
 
   event = {
     data: undefined,
@@ -24353,6 +24392,7 @@ class EventSourceStream extends Transform {
 
   /**
    * @param {object} options
+   * @param {number} [options.maxEventSize]
    * @param {eventSourceSettings} options.eventSourceSettings
    * @param {Function} [options.push]
    */
@@ -24364,6 +24404,12 @@ class EventSourceStream extends Transform {
     super(options)
 
     this.state = options.eventSourceSettings || {}
+    this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize
+    const parserItemLimit = this.maxEventSize > 0
+      ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem)))
+      : 0
+    this.maxDataLines = parserItemLimit
+    this.maxBufferedChunks = parserItemLimit
     if (options.push) {
       this.push = options.push
     }
@@ -24381,6 +24427,14 @@ class EventSourceStream extends Transform {
       return
     }
 
+    // A leading line ending can immediately release the currently buffered
+    // line, even when it uses the final allowed chunk slot.
+    if (this.maxEventSize > 0 &&
+        this.chunks.length >= this.maxBufferedChunks &&
+        chunk[0] !== LF && chunk[0] !== CR) {
+      callback(createMaxEventSizeExceededError())
+      return
+    }
     this.chunks.push(chunk)
 
     // Strip leading byte-order-mark if we opened the stream and started
@@ -24459,7 +24513,12 @@ class EventSourceStream extends Transform {
 
         // In any case, we can process the line as we reached an
         // end-of-line character
-        this.parseLine(this.readLine(), this.event)
+        try {
+          this.parseLine(this.readLine(), this.event)
+        } catch (error) {
+          callback(error)
+          return
+        }
         this.consumeCurrentByte()
         // A line was processed and this could be the end of the event. We need
         // to check if the next line is empty to determine if the event is
@@ -24468,15 +24527,28 @@ class EventSourceStream extends Transform {
         continue
       }
 
+      // readLine() is only called after CR or LF. Reject an unfinished line
+      // before it can retain an unbounded number of decoded chunks. The seven
+      // extra bytes allow the longest field prefix ("event: " or "retry: ").
+      if (this.maxEventSize > 0 && ++this.lineLength > this.maxEventSize + 7) {
+        callback(createMaxEventSizeExceededError())
+        return
+      }
       this.advanceCursor()
     }
 
     callback()
   }
 
+  _destroy (error, callback) {
+    this.chunks.length = 0
+    this.clearEvent()
+    super._destroy(error, callback)
+  }
+
   /**
    * @param {Buffer} line
-   * @param {EventStreamEvent} event
+   * @param {EventSourceStreamEvent} event
    */
   parseLine (line, event) {
     // If the line is empty (a blank line)
@@ -24510,6 +24582,13 @@ class EventSourceStream extends Transform {
     }
 
     if (isFieldName(line, fieldLength, DATA)) {
+      if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
+        throw createMaxEventSizeExceededError()
+      }
+      const valueBytes = line.length - valueStart
+      const dataSize = this.eventFieldSizes.data + (event.data === undefined ? 0 : 1) + valueBytes
+      this.setEventFieldSize('data', dataSize)
+
       const value = line.toString('utf8', valueStart)
 
       if (event.data === undefined) {
@@ -24517,11 +24596,13 @@ class EventSourceStream extends Transform {
       } else {
         event.data += `\n${value}`
       }
+      this.dataLineCount++
       return
     }
 
     if (isFieldName(line, fieldLength, RETRY)) {
       if (isASCIINumberBytes(line, valueStart)) {
+        this.setEventFieldSize('retry', line.length - valueStart)
         event.retry = line.toString('utf8', valueStart)
       }
       return
@@ -24529,18 +24610,27 @@ class EventSourceStream extends Transform {
 
     if (isFieldName(line, fieldLength, ID)) {
       if (isValidLastEventIdBytes(line, valueStart)) {
+        this.setEventFieldSize('id', line.length - valueStart)
         event.id = line.toString('utf8', valueStart)
       }
       return
     }
 
     if (isFieldName(line, fieldLength, EVENT)) {
-      const value = line.toString('utf8', valueStart)
-
-      if (value.length > 0) {
-        event.event = value
+      if (valueStart < line.length) {
+        this.setEventFieldSize('event', line.length - valueStart)
+        event.event = line.toString('utf8', valueStart)
       }
     }
+  }
+
+  setEventFieldSize (field, size) {
+    const eventSize = this.eventSize - this.eventFieldSizes[field] + size
+    if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
+      throw createMaxEventSizeExceededError()
+    }
+    this.eventSize = eventSize
+    this.eventFieldSizes[field] = size
   }
 
   /**
@@ -24573,6 +24663,12 @@ class EventSourceStream extends Transform {
     this.event.event = undefined
     this.event.id = undefined
     this.event.retry = undefined
+    this.eventSize = 0
+    this.dataLineCount = 0
+    this.eventFieldSizes.data = 0
+    this.eventFieldSizes.event = 0
+    this.eventFieldSizes.id = 0
+    this.eventFieldSizes.retry = 0
   }
 
   hasPendingEvent () {
@@ -24608,14 +24704,16 @@ class EventSourceStream extends Transform {
   syncLineStartToCursor () {
     this.lineChunkIndex = this.chunkIndex
     this.linePos = this.pos
+    this.lineLength = 0
     this.dropConsumedChunks()
   }
 
   dropConsumedChunks () {
-    while (this.lineChunkIndex > 0) {
-      this.chunks.shift()
-      this.lineChunkIndex--
-      this.chunkIndex--
+    if (this.lineChunkIndex > 0) {
+      const consumed = this.lineChunkIndex
+      this.chunks.splice(0, consumed)
+      this.lineChunkIndex = 0
+      this.chunkIndex -= consumed
     }
 
     if (this.chunkIndex === this.chunks.length) {
@@ -24741,6 +24839,7 @@ const { isNetworkError } = __nccwpck_require__(9051)
 const { delay } = __nccwpck_require__(4811)
 const { kEnumerableProperty } = __nccwpck_require__(3440)
 const { environmentSettingsObject } = __nccwpck_require__(3168)
+const { getGlobalDispatcher } = __nccwpck_require__(2581)
 
 let experimentalWarned = false
 
@@ -25022,6 +25121,7 @@ class EventSource extends EventTarget {
 
       const eventSourceStream = new EventSourceStream({
         eventSourceSettings: this.#state,
+        maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
         push: (event) => {
           this.dispatchEvent(createFastMessageEvent(
             event.type,
@@ -25200,7 +25300,8 @@ webidl.converters.EventSourceInitDict = webidl.dictionaryConverter([
   },
   {
     key: 'dispatcher', // undici only
-    converter: webidl.converters.any
+    converter: webidl.converters.any,
+    defaultValue: () => getGlobalDispatcher()
   }
 ])
 
@@ -30307,8 +30408,10 @@ async function httpNetworkFetch (
   // 19. Run these steps in parallel:
 
   //    1. Run these steps, but abort when fetchParams is canceled:
-  fetchParams.controller.onAborted = onAborted
-  fetchParams.controller.on('terminated', onAborted)
+  if (!fetchParams.controller.resume) {
+    fetchParams.controller.on('terminated', onAborted)
+  }
+
   fetchParams.controller.resume = async () => {
     // 1. While true
     while (true) {
@@ -30477,8 +30580,6 @@ async function httpNetworkFetch (
           }
           location = headersList.get('location', true)
 
-          this.body = new Readable({ read: resume })
-
           const decoders = []
 
           const willFollow = location && request.redirect === 'follow' &&
@@ -30496,7 +30597,7 @@ async function httpNetworkFetch (
             // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
             const maxContentEncodings = 5
             if (codings.length > maxContentEncodings) {
-              reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
+              this.abort(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
               return true
             }
 
@@ -30528,6 +30629,8 @@ async function httpNetworkFetch (
               }
             }
           }
+
+          this.body = new Readable({ read: resume })
 
           const onError = this.onError.bind(this)
 
@@ -30573,10 +30676,6 @@ async function httpNetworkFetch (
         onComplete () {
           if (this.abort) {
             fetchParams.controller.off('terminated', this.abort)
-          }
-
-          if (fetchParams.controller.onAborted) {
-            fetchParams.controller.off('terminated', fetchParams.controller.onAborted)
           }
 
           fetchParams.controller.ended = true
@@ -37069,6 +37168,20 @@ class ByteParser extends Writable {
         if (isControlFrame(this.#info.opcode)) {
           this.#loop = this.parseControlFrame(body)
           this.#state = parserStates.INFO
+
+          // If the automatic PONG/CLOSE reply filled the socket's write buffer,
+          // stop parsing and resume on drain so a PING flood cannot grow the
+          // outbound queue without bound.
+          const socket = this.ws[kResponse].socket
+          if (this.#loop && socket.writableNeedDrain) {
+            this.#loop = false
+            socket.once('drain', () => {
+              if (this.destroyed) return
+              this.#loop = true
+              this.run(callback)
+            })
+            return
+          }
         } else {
           if (!this.#info.compressed) {
             if (!this.writeFragments(body)) {
@@ -38771,24 +38884,6 @@ var __webpack_exports__ = {};
 (() => {
 "use strict";
 
-// NAMESPACE OBJECT: ./node_modules/nodemailer/dist/esm/base64/index.js
-var base64_namespaceObject = {};
-__nccwpck_require__.r(base64_namespaceObject);
-__nccwpck_require__.d(base64_namespaceObject, {
-  Encoder: () => (Encoder),
-  encode: () => (base64_encode),
-  wrap: () => (wrap)
-});
-
-// NAMESPACE OBJECT: ./node_modules/nodemailer/dist/esm/qp/index.js
-var qp_namespaceObject = {};
-__nccwpck_require__.r(qp_namespaceObject);
-__nccwpck_require__.d(qp_namespaceObject, {
-  Encoder: () => (qp_Encoder),
-  encode: () => (qp_encode),
-  wrap: () => (qp_wrap)
-});
-
 // NAMESPACE OBJECT: ./node_modules/axios/lib/platform/common/utils.js
 var common_utils_namespaceObject = {};
 __nccwpck_require__.r(common_utils_namespaceObject);
@@ -38984,6 +39079,7 @@ const basicToDigit = function (codePoint) {
  * @see `basicToDigit()`
  * @private
  * @param digit The numeric value of a basic code point.
+ * @param flag Non-zero to use the uppercase form of the code point.
  * @returns The basic code point whose value (when used for
  * representing integers) is `digit`, which needs to be in the range
  * `0` to `base - 1`. If `flag` is non-zero, the uppercase form is
@@ -39234,10 +39330,27 @@ const ucs2 = {
 // Matches a "scheme:" not followed by "//" (and with something after it), used
 // to re-insert the authority separator the legacy parser did not require.
 const SLASHLESS_AUTHORITY = /^([a-zA-Z][a-zA-Z0-9+.-]*:)(?!\/\/)([\s\S]+)$/;
-// Leading and trailing C0 controls and spaces, which the WHATWG parser strips before it
-// looks at the input. Stripped up front so that the slash-less form is recognized in a
-// value read from a file with a trailing newline as well.
-const SURROUNDING_WHITESPACE = /^[\x00-\x20]+|[\x00-\x20]+$/g;
+/**
+ * Drops the leading and trailing C0 controls and spaces, which the WHATWG parser strips
+ * before it looks at the input. Stripped up front so that the slash-less form is recognized
+ * in a value read from a file with a trailing newline as well. An index scan, the regex
+ * /^[\x00-\x20]+|[\x00-\x20]+$/g retried a run of spaces inside the value from every
+ * position in it
+ *
+ * @param input URL string
+ * @returns The string without the surrounding controls and spaces
+ */
+function stripSurroundingWhitespace(input) {
+    let start = 0;
+    let end = input.length;
+    while (start < end && input.charCodeAt(start) <= 0x20) {
+        start++;
+    }
+    while (end > start && input.charCodeAt(end - 1) <= 0x20) {
+        end--;
+    }
+    return input.slice(start, end);
+}
 // Leading characters legacy url.parse() skips before it reads the scheme
 const LEGACY_TRIM = /^[\x00-\x20\u00a0\ufeff]+/;
 // The authority of a "scheme://authority/..." or a scheme-relative "//authority/..."
@@ -39332,7 +39445,7 @@ function normalizeHostname(raw, href) {
     return mapped;
 }
 const parse = (input, parseQueryString) => {
-    input = (input || '').replace(SURROUNDING_WHITESPACE, '');
+    input = stripSurroundingWhitespace(input || '');
     // Legacy url.parse() parses a "user:pass@host:port" authority that follows
     // the scheme even without the "//" separator, for schemes outside its
     // built-in slashed-protocol list (smtp:/smtps:/socks:/...). The WHATWG
@@ -39536,19 +39649,31 @@ class Cookies {
      */
     parse(cookieStr) {
         const cookie = {};
+        let hasNameValue = false;
         (cookieStr || '')
             .toString()
             .split(';')
             .forEach(cookiePart => {
-            const valueParts = cookiePart.split('=');
-            const key = valueParts.shift().trim().toLowerCase();
-            let value = valueParts.join('=').trim();
-            let domain;
-            if (!key) {
+            if (!cookiePart.trim()) {
                 // skip empty parts
                 return;
             }
-            switch (key) {
+            const valueParts = cookiePart.split('=');
+            const name = valueParts.shift().trim();
+            let value = valueParts.join('=').trim();
+            let domain;
+            // the first part is always the name-value pair, so a cookie named
+            // like an attribute is not mistaken for one (RFC 6265 section 5.2)
+            if (!hasNameValue) {
+                hasNameValue = true;
+                if (name) {
+                    // cookie names are case-sensitive, only attribute names are not
+                    cookie.name = name;
+                    cookie.value = value;
+                }
+                return;
+            }
+            switch (name.toLowerCase()) {
                 case 'expires': {
                     const expires = new Date(value);
                     // ignore date if can not parse it
@@ -39576,11 +39701,6 @@ class Cookies {
                 case 'httponly':
                     cookie.httponly = true;
                     break;
-                default:
-                    if (!cookie.name) {
-                        cookie.name = key;
-                        cookie.value = value;
-                    }
             }
         });
         return cookie;
@@ -39597,16 +39717,14 @@ class Cookies {
         // check if hostname matches
         // .foo.com also matches subdomains, foo.com does not
         if (urlparts.hostname !== cookie.domain &&
-            (cookie.domain.charAt(0) !== '.' ||
-                ('.' + urlparts.hostname).substr(-cookie.domain.length) !== cookie.domain)) {
+            (cookie.domain.charAt(0) !== '.' || ('.' + urlparts.hostname).substr(-cookie.domain.length) !== cookie.domain)) {
             return false;
         }
         // check if the request path path-matches the cookie path (RFC 6265 section 5.1.4):
         // identical paths match, otherwise the cookie path must be a directory prefix
         const pathname = urlparts.pathname || '/';
         const cookiePath = cookie.path;
-        const pathMatches = pathname === cookiePath ||
-            (pathname.startsWith(cookiePath) && (cookiePath.endsWith('/') || pathname.charAt(cookiePath.length) === '/'));
+        const pathMatches = pathname === cookiePath || (pathname.startsWith(cookiePath) && (cookiePath.endsWith('/') || pathname.charAt(cookiePath.length) === '/'));
         if (!pathMatches) {
             return false;
         }
@@ -39683,11 +39801,12 @@ class Cookies {
         return path;
     }
 }
+/* harmony default export */ const fetch_cookies = (Cookies);
 
 ;// CONCATENATED MODULE: ./node_modules/nodemailer/dist/esm/package-info.js
 // Generated by scripts/build.js from package.json. Do not edit by hand.
 const package_info_name = 'nodemailer';
-const package_info_version = '10.0.10';
+const package_info_version = '10.2.1';
 const homepage = 'https://nodemailer.com/';
 
 ;// CONCATENATED MODULE: ./node_modules/nodemailer/dist/esm/errors.js
@@ -39758,6 +39877,28 @@ const EPROXY = 'EPROXY';
 const EFILEACCESS = 'EFILEACCESS';
 const EURLACCESS = 'EURLACCESS';
 const EFETCH = 'EFETCH';
+/**
+ * Tells whether the error ended the connection rather than rejected what was sent over it
+ */
+const isTransientError = (err) => err.responseCode === 421 || err.code === ECONNECTION || err.code === ESOCKET || err.code === ETIMEDOUT;
+/**
+ * Tells whether an SMTP reply code is a permanent rejection, one that retrying the same
+ * message would get again. RFC 5321 makes every 5yz reply a permanent negative completion
+ * and every 4yz reply a transient one. 503 (bad sequence of commands) is the exception: it
+ * says the session was in the wrong state for the command rather than that the message was
+ * refused, so the same message can go through on a new connection. 2yz and 3yz replies are
+ * only an error when the client expected something else, and are not permanent either.
+ *
+ * @param responseCode SMTP reply code
+ * @returns true for a permanent rejection
+ */
+const isPermanentResponseCode = (responseCode) => responseCode >= 500 && responseCode < 600 && responseCode !== 503;
+/**
+ * Code Node.js sets on an error when its permission model (`--permission`) denies an
+ * operation. It is not replaced with the Nodemailer code of the failing step (`ESOCKET`,
+ * `EDNS`, `EFETCH`, ...), so a missing grant such as `--allow-net` stays recognizable.
+ */
+const ERR_ACCESS_DENIED = 'ERR_ACCESS_DENIED';
 
 ;// CONCATENATED MODULE: ./node_modules/nodemailer/dist/esm/shared/objects.js
 // Safe copying of objects whose keys come from the caller.
@@ -39811,6 +39952,14 @@ const copyOwnKeys = (target, source, skip) => {
 
 
 const MAX_REDIRECTS = 5;
+// a stalled server would otherwise hold the request, and whatever waits on it, open forever
+const DEFAULT_TIMEOUT = 60 * 1000;
+// the inactivity timeout above is reset by every byte, so a server dripping one within each
+// window could still hold the request, and the message being built from it, open for as
+// long as it liked. The whole request, redirects included, has to be done within this
+const DEFAULT_MAX_TIME = 2 * 60 * 1000;
+// the body is usually buffered in memory by the caller, so an unbounded download is refused
+const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
 // Only genuine TLS settings are taken from options.tls. That object reaches us straight
 // from a user supplied attachment (content.tls), so keys like host, port, path, socketPath
 // or lookup would otherwise repoint the request at a destination that never went through
@@ -39842,6 +39991,17 @@ const TLS_OPTION_KEYS = [
     'sigalgs'
 ];
 /**
+ * Marks an error of the request as a fetch error, unless it is a permission model
+ * denial, which keeps its own code (see ERR_ACCESS_DENIED)
+ *
+ * @param err Error to mark
+ */
+function setFetchCode(err) {
+    if (err.code !== ERR_ACCESS_DENIED) {
+        err.code = EFETCH;
+    }
+}
+/**
  * Resolves a URL only if it is one this module is willing to request.
  *
  * urllib.parse throws for a host that contains forbidden bytes, and it is called for
@@ -39865,12 +40025,22 @@ function parseFetchUrl(url) {
     }
     return parsed;
 }
+// the port a request to the URL goes to, explicit or the default of its scheme
+function fetchPort(parsed) {
+    return parsed.port ? Number(parsed.port) : parsed.protocol === 'https:' ? 443 : 80;
+}
 function nmfetch(url, options) {
     options = options || {};
     options.fetchRes = options.fetchRes || new external_node_stream_.PassThrough();
-    options.cookies = options.cookies || new Cookies();
+    options.cookies = options.cookies || new fetch_cookies();
     options.redirects = options.redirects || 0;
     options.maxRedirects = isNaN(options.maxRedirects) ? MAX_REDIRECTS : options.maxRedirects;
+    if (!options.deadline) {
+        options.maxTime = typeof options.maxTime === 'number' && options.maxTime >= 0 ? options.maxTime : DEFAULT_MAX_TIME;
+        // the one deadline is shared with the requests the redirects lead to, every hop
+        // gets the time that is left rather than starting over
+        options.deadline = options.maxTime ? Date.now() + options.maxTime : 0;
+    }
     const fetchRes = options.fetchRes;
     const parsed = parseFetchUrl(url);
     if (!parsed) {
@@ -39937,7 +40107,7 @@ function nmfetch(url, options) {
                     return;
                 }
                 finished = true;
-                err.code = EFETCH;
+                setFetchCode(err);
                 err.sourceUrl = url;
                 fetchRes.emit('error', err);
             });
@@ -39957,14 +40127,14 @@ function nmfetch(url, options) {
                         .join('&'));
                 }
                 catch (E) {
-                    if (finished) {
-                        return undefined;
-                    }
+                    // the caller attaches its error listener once nmfetch has returned, so
+                    // the error is emitted on the next tick and the stream is handed back
+                    // the way every other failure is reported
                     finished = true;
                     E.code = EFETCH;
                     E.sourceUrl = url;
-                    fetchRes.emit('error', E);
-                    return undefined;
+                    setImmediate(() => fetchRes.emit('error', E));
+                    return fetchRes;
                 }
             }
             else {
@@ -39981,7 +40151,7 @@ function nmfetch(url, options) {
         method,
         host: parsed.hostname,
         path: parsed.path,
-        port: parsed.port ? parsed.port : parsed.protocol === 'https:' ? 443 : 80,
+        port: fetchPort(parsed),
         headers,
         // Validate TLS certificates by default. Callers that genuinely need to
         // reach a self-signed/internal host opt out explicitly with
@@ -39997,11 +40167,7 @@ function nmfetch(url, options) {
             }
         });
     }
-    if (parsed.protocol === 'https:' &&
-        parsed.hostname &&
-        parsed.hostname !== reqOptions.host &&
-        !external_node_net_.isIP(parsed.hostname) &&
-        !reqOptions.servername) {
+    if (parsed.protocol === 'https:' && parsed.hostname && parsed.hostname !== reqOptions.host && !external_node_net_.isIP(parsed.hostname) && !reqOptions.servername) {
         reqOptions.servername = parsed.hostname;
     }
     try {
@@ -40010,33 +40176,52 @@ function nmfetch(url, options) {
     catch (E) {
         finished = true;
         setImmediate(() => {
-            E.code = EFETCH;
+            setFetchCode(E);
             E.sourceUrl = url;
             fetchRes.emit('error', E);
         });
         return fetchRes;
     }
-    if (options.timeout) {
-        req.setTimeout(options.timeout, () => {
-            if (finished) {
-                return;
-            }
-            finished = true;
-            req.abort();
-            const err = new Error('Request Timeout');
-            err.code = EFETCH;
-            err.sourceUrl = url;
-            fetchRes.emit('error', err);
-        });
-    }
-    req.on('error', (err) => {
+    // the whole request has to be done by options.deadline, see maxTime. The timer is
+    // released on every way out of the request, so it never outlives it
+    let deadlineTimer;
+    const clearDeadline = () => {
+        if (deadlineTimer) {
+            clearTimeout(deadlineTimer);
+            deadlineTimer = undefined;
+        }
+    };
+    // reports the first failure of this request on fetchRes and releases the request
+    const fail = (err, sourceUrl = url) => {
         if (finished) {
             return;
         }
         finished = true;
-        err.code = EFETCH;
-        err.sourceUrl = url;
+        clearDeadline();
+        setFetchCode(err);
+        err.sourceUrl = sourceUrl;
         fetchRes.emit('error', err);
+        req.abort();
+    };
+    const timeout = typeof options.timeout === 'number' && options.timeout >= 0 ? options.timeout : DEFAULT_TIMEOUT;
+    if (timeout) {
+        req.setTimeout(timeout, () => fail(new Error('Request Timeout')));
+    }
+    if (options.deadline) {
+        deadlineTimer = setTimeout(() => fail(new Error('Request exceeded the allowed ' + options.maxTime + ' ms')), Math.max(options.deadline - Date.now(), 1));
+        // a pending deadline is no reason to keep the process alive
+        deadlineTimer.unref();
+    }
+    req.on('error', (err) => fail(err));
+    // a consumer that destroys the response stream before it ended does not want the rest of
+    // the body, release the request now instead of when the timeout fires
+    fetchRes.once('close', () => {
+        clearDeadline();
+        if (finished || fetchRes.readableEnded) {
+            return;
+        }
+        finished = true;
+        req.destroy();
     });
     req.on('response', res => {
         let inflate;
@@ -40058,13 +40243,7 @@ function nmfetch(url, options) {
             // redirect
             options.redirects++;
             if (options.redirects > options.maxRedirects) {
-                finished = true;
-                const err = new Error('Maximum redirect count exceeded');
-                err.code = EFETCH;
-                err.sourceUrl = url;
-                fetchRes.emit('error', err);
-                req.abort();
-                return;
+                return fail(new Error('Maximum redirect count exceeded'));
             }
             // redirect does not include POST body
             options.method = 'GET';
@@ -40084,64 +40263,53 @@ function nmfetch(url, options) {
                 // call: that call gets its own `finished` flag and no handle on this
                 // request, so this one would stay open and could emit a second error on
                 // the shared fetchRes once it times out. Callers listen with req.once().
-                finished = true;
-                const err = new Error('Unsupported protocol for URL ' + redirectUrl);
-                err.code = EFETCH;
-                err.sourceUrl = redirectUrl;
-                fetchRes.emit('error', err);
-                req.abort();
-                return;
+                return fail(new Error('Unsupported protocol for URL ' + redirectUrl), redirectUrl);
             }
-            // Do not forward credentials when the redirect leaves the original
-            // security context: a different host, or a downgrade from https to
-            // http (which would otherwise put them on the wire in cleartext).
-            // Strip sensitive request headers so an attacker who controls the
-            // redirect target cannot harvest them.
-            const crossHost = redirectParsed.hostname !== parsed.hostname;
-            const downgrade = parsed.protocol === 'https:' && redirectParsed.protocol === 'http:';
-            if (options.headers && (crossHost || downgrade)) {
+            // Do not forward credentials when the redirect leaves the origin: a different
+            // scheme, host or port is a different security context (an https to http
+            // downgrade would also put them on the wire in cleartext). Strip sensitive
+            // request headers so an attacker who controls the redirect target cannot
+            // harvest them.
+            const crossOrigin = redirectParsed.protocol !== parsed.protocol || redirectParsed.hostname !== parsed.hostname || fetchPort(redirectParsed) !== fetchPort(parsed);
+            if (options.headers && crossOrigin) {
                 const sensitive = ['authorization', 'cookie', 'proxy-authorization'];
                 Object.keys(options.headers).forEach(key => {
-                    if (sensitive.includes(key.toLowerCase())) {
+                    // normalized the way the request headers are built above, a padded name is sent too
+                    if (sensitive.includes(key.toLowerCase().trim())) {
                         delete options.headers[key];
                     }
                 });
             }
+            // this request is done with, release it so its socket and timeout do not
+            // outlive it and report a late error on the shared fetchRes
+            finished = true;
+            clearDeadline();
+            res.resume();
+            req.abort();
             return nmfetch(redirectUrl, options);
         }
         fetchRes.statusCode = res.statusCode;
         fetchRes.headers = res.headers;
         if (res.statusCode >= 300 && !options.allowErrorResponse) {
-            finished = true;
-            const err = new Error('Invalid status code ' + res.statusCode);
-            err.code = EFETCH;
-            err.sourceUrl = url;
-            fetchRes.emit('error', err);
-            req.abort();
-            return;
+            return fail(new Error('Invalid status code ' + res.statusCode));
         }
-        res.on('error', (err) => {
-            if (finished) {
+        res.on('error', (err) => fail(err));
+        // the response is in, whatever is left of it is in memory and no longer on the network
+        res.once('end', () => clearDeadline());
+        const maxBytes = typeof options.maxBytes === 'number' && options.maxBytes > 0 ? options.maxBytes : DEFAULT_MAX_BYTES;
+        const source = inflate || res;
+        let received = 0;
+        source.on('data', (chunk) => {
+            received += chunk.length;
+            if (received <= maxBytes || finished) {
                 return;
             }
-            finished = true;
-            err.code = EFETCH;
-            err.sourceUrl = url;
-            fetchRes.emit('error', err);
-            req.abort();
+            source.unpipe(fetchRes);
+            fail(new Error('Response size exceeds the allowed ' + maxBytes + ' bytes'));
         });
         if (inflate) {
             res.pipe(inflate).pipe(fetchRes);
-            inflate.on('error', (err) => {
-                if (finished) {
-                    return;
-                }
-                finished = true;
-                err.code = EFETCH;
-                err.sourceUrl = url;
-                fetchRes.emit('error', err);
-                req.abort();
-            });
+            inflate.on('error', (err) => fail(err));
         }
         else {
             res.pipe(fetchRes);
@@ -40156,18 +40324,16 @@ function nmfetch(url, options) {
                 req.write(body);
             }
             catch (err) {
-                finished = true;
-                err.code = EFETCH;
-                err.sourceUrl = url;
-                fetchRes.emit('error', err);
-                return;
+                return fail(err);
             }
         }
         req.end();
     });
     return fetchRes;
 }
-nmfetch.Cookies = Cookies;
+nmfetch.Cookies = fetch_cookies;
+nmfetch.DEFAULT_TIMEOUT = DEFAULT_TIMEOUT;
+nmfetch.DEFAULT_MAX_TIME = DEFAULT_MAX_TIME;
 /* harmony default export */ const esm_fetch = (nmfetch);
 
 // EXTERNAL MODULE: external "node:dns"
@@ -40176,6 +40342,7 @@ var external_node_dns_ = __nccwpck_require__(610);
 const external_node_os_namespaceObject = require("node:os");
 ;// CONCATENATED MODULE: ./node_modules/nodemailer/dist/esm/shared/index.js
 /* eslint no-console: 0 */
+
 
 
 
@@ -40198,14 +40365,24 @@ const _resetCacheCleanup = () => {
     lastCacheCleanup = 0;
 };
 let networkInterfaces;
-try {
-    networkInterfaces = external_node_os_namespaceObject.networkInterfaces();
-}
-catch (_err) {
-    // fails on some systems
-}
+let networkInterfacesRead = false;
+// Read on first use rather than at load, so that importing the module does not ask for
+// the interface table (Deno prompts for --allow-sys on it)
+/** @internal */
+const _readNetworkInterfaces = () => {
+    if (!networkInterfacesRead) {
+        networkInterfacesRead = true;
+        try {
+            networkInterfaces = external_node_os_namespaceObject.networkInterfaces();
+        }
+        catch (_err) {
+            // fails on some systems
+        }
+    }
+    return networkInterfaces;
+};
 const isFamilySupported = (family, allowInternal) => {
-    const addresses = Object.values(networkInterfaces || {}).flat();
+    const addresses = Object.values(_readNetworkInterfaces() || {}).flat();
     if (!addresses.length) {
         // hope for the best. Runtimes without an interface table (Cloudflare
         // Workers) report an empty object rather than throwing
@@ -40216,7 +40393,8 @@ const isFamilySupported = (family, allowInternal) => {
 const shared_resolve = (family, hostname, options, callback) => {
     options = options || {};
     if (!isFamilySupported(family, options.allowInternalNetworkInterfaces)) {
-        return callback(null, []);
+        callback(null, []);
+        return null;
     }
     const dnsResolver = external_node_dns_.Resolver ? new external_node_dns_.Resolver(options) : external_node_dns_;
     dnsResolver['resolve' + family](hostname, (err, addresses) => {
@@ -40235,6 +40413,7 @@ const shared_resolve = (family, hostname, options, callback) => {
         }
         return callback(null, Array.isArray(addresses) ? addresses : [].concat(addresses || []));
     });
+    return external_node_dns_.Resolver ? dnsResolver : null;
 };
 const dnsCache = new Map();
 const formatDNSValue = (value, extra) => {
@@ -40298,115 +40477,137 @@ const resolveHostname = (options, callback) => {
             }));
         }
     }
-    // Resolve both IPv4 and IPv6 addresses for fallback support
+    // The timeout limits the lookup as a whole. It is also handed to the resolver, but there
+    // it applies to every query attempt on its own, and the resolver retries a few times
+    let responded = false;
+    let deadline;
+    const respond = (err, result) => {
+        if (responded) {
+            return;
+        }
+        responded = true;
+        clearTimeout(deadline);
+        callback(err, result);
+    };
+    // a stale cached value is still better than no value at all
+    const respondCached = (error) => {
+        if (!cached) {
+            return false;
+        }
+        dnsCache.set(host, {
+            value: cached.value,
+            expires: Date.now() + (options.dnsTtl || DNS_TTL)
+        });
+        respond(null, formatDNSValue(cached.value, {
+            servername,
+            cached: true,
+            error
+        }));
+        return true;
+    };
+    const resolvers = [];
+    const timeout = Number(options.timeout) || 0;
+    if (timeout > 0) {
+        deadline = setTimeout(() => {
+            for (const resolver of resolvers) {
+                if (typeof resolver.cancel === 'function') {
+                    resolver.cancel();
+                }
+            }
+            const err = new Error('DNS lookup for ' + host + ' timed out');
+            err.code = external_node_dns_.TIMEOUT;
+            if (!respondCached(err)) {
+                respond(err);
+            }
+        }, timeout);
+    }
+    // Resolve both IPv4 and IPv6 addresses for fallback support, at the same time
     let ipv4Addresses = [];
     let ipv6Addresses = [];
     let ipv4Error = null;
     let ipv6Error = null;
-    shared_resolve(4, options.host, options, (err, addresses) => {
-        if (err) {
-            ipv4Error = err;
+    let pending = 2;
+    const onResolved = () => {
+        if (--pending || responded) {
+            return;
         }
-        else {
-            ipv4Addresses = addresses || [];
+        // Combine addresses: IPv4 first, then IPv6
+        const allAddresses = ipv4Addresses.concat(ipv6Addresses);
+        if (allAddresses.length) {
+            const value = {
+                addresses: allAddresses
+            };
+            dnsCache.set(host, {
+                value,
+                expires: Date.now() + (options.dnsTtl || DNS_TTL)
+            });
+            return respond(null, formatDNSValue(value, {
+                servername,
+                cached: false
+            }));
         }
-        shared_resolve(6, host, options, (err, addresses) => {
-            if (err) {
-                ipv6Error = err;
-            }
-            else {
-                ipv6Addresses = addresses || [];
-            }
-            // Combine addresses: IPv4 first, then IPv6
-            const allAddresses = ipv4Addresses.concat(ipv6Addresses);
-            if (allAddresses.length) {
+        // No addresses from resolve4/resolve6, try dns.lookup as fallback
+        if (ipv4Error && ipv6Error && respondCached(ipv4Error)) {
+            // Both resolvers had errors
+            return;
+        }
+        try {
+            external_node_dns_.lookup(host, { all: true }, (err, addresses) => {
+                if (err) {
+                    if (respondCached(err)) {
+                        return;
+                    }
+                    return respond(err);
+                }
+                // Get all supported addresses from dns.lookup
+                const supportedAddresses = addresses ? addresses.filter(addr => isFamilySupported(addr.family)).map(addr => addr.address) : [];
+                if (addresses && addresses.length && !supportedAddresses.length) {
+                    // there are addresses but none can be used
+                    console.warn(`Failed to resolve IPv${addresses[0].family} addresses with current network`);
+                }
+                if (!supportedAddresses.length && cached) {
+                    // nothing was found, fallback to cached value
+                    return respond(null, formatDNSValue(cached.value, {
+                        servername,
+                        cached: true
+                    }));
+                }
                 const value = {
-                    addresses: allAddresses
+                    addresses: supportedAddresses.length ? supportedAddresses : [host]
                 };
                 dnsCache.set(host, {
                     value,
                     expires: Date.now() + (options.dnsTtl || DNS_TTL)
                 });
-                return callback(null, formatDNSValue(value, {
+                return respond(null, formatDNSValue(value, {
                     servername,
                     cached: false
                 }));
+            });
+        }
+        catch (lookupErr) {
+            if (respondCached(lookupErr)) {
+                return;
             }
-            // No addresses from resolve4/resolve6, try dns.lookup as fallback
-            if (ipv4Error && ipv6Error) {
-                // Both resolvers had errors
-                if (cached) {
-                    dnsCache.set(host, {
-                        value: cached.value,
-                        expires: Date.now() + (options.dnsTtl || DNS_TTL)
-                    });
-                    return callback(null, formatDNSValue(cached.value, {
-                        servername,
-                        cached: true,
-                        error: ipv4Error
-                    }));
-                }
+            return respond(ipv4Error || ipv6Error || lookupErr);
+        }
+    };
+    for (const family of [4, 6]) {
+        const resolver = shared_resolve(family, host, options, (err, addresses) => {
+            if (family === 4) {
+                ipv4Error = err;
+                ipv4Addresses = addresses || [];
             }
-            try {
-                external_node_dns_.lookup(host, { all: true }, (err, addresses) => {
-                    if (err) {
-                        if (cached) {
-                            dnsCache.set(host, {
-                                value: cached.value,
-                                expires: Date.now() + (options.dnsTtl || DNS_TTL)
-                            });
-                            return callback(null, formatDNSValue(cached.value, {
-                                servername,
-                                cached: true,
-                                error: err
-                            }));
-                        }
-                        return callback(err);
-                    }
-                    // Get all supported addresses from dns.lookup
-                    const supportedAddresses = addresses
-                        ? addresses.filter(addr => isFamilySupported(addr.family)).map(addr => addr.address)
-                        : [];
-                    if (addresses && addresses.length && !supportedAddresses.length) {
-                        // there are addresses but none can be used
-                        console.warn(`Failed to resolve IPv${addresses[0].family} addresses with current network`);
-                    }
-                    if (!supportedAddresses.length && cached) {
-                        // nothing was found, fallback to cached value
-                        return callback(null, formatDNSValue(cached.value, {
-                            servername,
-                            cached: true
-                        }));
-                    }
-                    const value = {
-                        addresses: supportedAddresses.length ? supportedAddresses : [host]
-                    };
-                    dnsCache.set(host, {
-                        value,
-                        expires: Date.now() + (options.dnsTtl || DNS_TTL)
-                    });
-                    return callback(null, formatDNSValue(value, {
-                        servername,
-                        cached: false
-                    }));
-                });
+            else {
+                ipv6Error = err;
+                ipv6Addresses = addresses || [];
             }
-            catch (lookupErr) {
-                if (cached) {
-                    dnsCache.set(host, {
-                        value: cached.value,
-                        expires: Date.now() + (options.dnsTtl || DNS_TTL)
-                    });
-                    return callback(null, formatDNSValue(cached.value, {
-                        servername,
-                        cached: true,
-                        error: lookupErr
-                    }));
-                }
-                return callback(ipv4Error || ipv6Error || lookupErr);
-            }
+            onResolved();
         });
-    });
+        if (resolver) {
+            resolvers.push(resolver);
+        }
+    }
 };
 /**
  * Parses connection url to a structured configuration object
@@ -40495,6 +40696,7 @@ const _logFunc = (logger, level, defaults, data, message, ...args) => {
  * creates a default console logger
  *
  * @param [options] Options object that might include 'logger' value
+ * @param [defaults] Fields merged into every log entry, overridden by the fields of the entry itself
  * @return bunyan compatible logger
  */
 const getLogger = (options, defaults) => {
@@ -40510,8 +40712,10 @@ const getLogger = (options, defaults) => {
     }
     const logger = options.logger === true ? createDefaultLogger(levels) : options.logger;
     levels.forEach(level => {
-        response[level] = (data, message, ...args) => {
-            _logFunc(logger, level, defaults, data, message, ...args);
+        response[level] = (...args) => {
+            // the bunyan forms: a data object first, or the message alone
+            const data = typeof args[0] === 'string' ? undefined : args.shift();
+            _logFunc(logger, level, defaults, data, ...args);
         };
     });
     return response;
@@ -40686,9 +40890,7 @@ const shared_assign = function (...args) {
             if (isProtoKey(key)) {
                 return;
             }
-            if (['tls', 'auth'].includes(key) &&
-                source[key] &&
-                typeof source[key] === 'object') {
+            if (['tls', 'auth'].includes(key) && source[key] && typeof source[key] === 'object') {
                 // tls and auth are special keys that need to be enumerated separately
                 // other objects are passed as is. Enumerating is a copy of user supplied
                 // keys just like the loop above, so it gets the same treatment
@@ -40722,6 +40924,53 @@ const encodeXText = (str) => {
     }
     return result;
 };
+// The first error a stream emitted, see recordStreamErrors
+const streamErrors = new WeakMap();
+/**
+ * Keeps the first error a content stream emits before it is read, so the error is reported
+ * when the stream is read instead of being thrown as unhandled. The listener stays attached
+ * for good, a stream that emits 'error' more than once never throws the later ones either
+ *
+ * @param stream Readable stream
+ */
+function recordStreamErrors(stream) {
+    stream.on('error', err => {
+        if (!streamErrors.has(stream)) {
+            streamErrors.set(stream, err);
+        }
+    });
+}
+/**
+ * Destroys a value if it is a readable stream that was not destroyed yet
+ *
+ * @param value Any content value
+ */
+function destroyStream(value) {
+    const stream = value;
+    if (stream && typeof stream.pipe === 'function' && typeof stream.destroy === 'function' && !stream.destroyed) {
+        stream.destroy();
+    }
+}
+/**
+ * Tells why a stream can not be read from start to end anymore. A stream that ended or was
+ * destroyed before anyone read it would never emit 'end' to a new reader, or, when piped, would
+ * end the destination right away and turn into an empty value without any error
+ *
+ * @param stream Readable stream
+ * @returns The error the stream failed with, an ESTREAM error, or null when it can be read
+ */
+function unreadableStreamError(stream) {
+    const err = streamErrors.get(stream) || stream.errored;
+    if (err) {
+        return err;
+    }
+    if (stream.readableEnded || stream.destroyed) {
+        const unreadable = new Error('Content stream was already read or destroyed');
+        unreadable.code = ESTREAM;
+        return unreadable;
+    }
+    return null;
+}
 /**
  * Streams a stream value into a Buffer
  *
@@ -40730,35 +40979,43 @@ const encodeXText = (str) => {
  */
 function resolveStream(stream, callback) {
     let responded = false;
+    const respond = (err, value) => {
+        if (responded) {
+            return;
+        }
+        responded = true;
+        callback(err, value);
+    };
+    const unreadable = unreadableStreamError(stream);
+    if (unreadable) {
+        // absorbs a later 'error' from the stream, there is nobody left to report it to
+        stream.on('error', () => false);
+        setImmediate(() => respond(unreadable));
+        return;
+    }
     const chunks = [];
     let chunklen = 0;
-    stream.on('error', err => {
-        if (responded) {
-            return;
+    stream.on('data', (chunk) => {
+        if (typeof chunk === 'string') {
+            chunk = Buffer.from(chunk);
         }
-        responded = true;
-        callback(err);
+        chunks.push(chunk);
+        chunklen += chunk.length;
     });
-    stream.on('readable', () => {
-        let chunk;
-        while ((chunk = stream.read()) !== null) {
-            chunks.push(chunk);
-            chunklen += chunk.length;
+    // finished() also reports a stream that is destroyed before 'end', which would otherwise
+    // leave the callback waiting forever
+    (0,external_node_stream_.finished)(stream, { writable: false }, err => {
+        if (err) {
+            return respond(err);
         }
-    });
-    stream.on('end', () => {
-        if (responded) {
-            return;
-        }
-        responded = true;
         let value;
         try {
             value = Buffer.concat(chunks, chunklen);
         }
         catch (E) {
-            return callback(E);
+            return respond(E);
         }
-        callback(null, value);
+        respond(null, value);
     });
 }
 /**
@@ -41907,10 +42164,7 @@ const extensions = new Map([
     ['bdm', 'application/vnd.syncml.dm+wbxml'],
     ['bed', 'application/vnd.realvnc.bed'],
     ['bh2', 'application/vnd.fujitsu.oasysprs'],
-    [
-        'bin',
-        ['application/octet-stream', 'application/mac-binary', 'application/macbinary', 'application/x-macbinary', 'application/x-binary']
-    ],
+    ['bin', ['application/octet-stream', 'application/mac-binary', 'application/macbinary', 'application/x-macbinary', 'application/x-binary']],
     ['bm', 'image/bmp'],
     ['bmi', 'application/vnd.bmi'],
     ['bmp', ['image/bmp', 'image/x-windows-bmp']],
@@ -41955,10 +42209,7 @@ const extensions = new Map([
     ['cii', 'application/vnd.anser-web-certificate-issue-initiation'],
     ['cil', 'application/vnd.ms-artgalry'],
     ['cla', 'application/vnd.claymore'],
-    [
-        'class',
-        ['application/octet-stream', 'application/java', 'application/java-byte-code', 'application/java-vm', 'application/x-java-class']
-    ],
+    ['class', ['application/octet-stream', 'application/java', 'application/java-byte-code', 'application/java-vm', 'application/x-java-class']],
     ['clkk', 'application/vnd.crick.clicker.keyboard'],
     ['clkp', 'application/vnd.crick.clicker.palette'],
     ['clkt', 'application/vnd.crick.clicker.template'],
@@ -42563,10 +42814,7 @@ const extensions = new Map([
     ['sbml', 'application/sbml+xml'],
     ['sc', 'application/vnd.ibm.secure-container'],
     ['scd', 'application/x-msschedule'],
-    [
-        'scm',
-        ['application/vnd.lotus-screencam', 'video/x-scm', 'text/x-script.guile', 'application/x-lotusscreencam', 'text/x-script.scheme']
-    ],
+    ['scm', ['application/vnd.lotus-screencam', 'video/x-scm', 'text/x-script.guile', 'application/x-lotusscreencam', 'text/x-script.scheme']],
     ['scq', 'application/scvp-cv-request'],
     ['scs', 'application/scvp-cv-response'],
     ['sct', 'text/scriptlet'],
@@ -42922,6 +43170,47 @@ function base64_encode(buffer) {
     return buffer.toString('base64');
 }
 /**
+ * Turns a line length option into a whole number of characters, the default for anything unusable
+ */
+function normalizeLineLength(lineLength) {
+    const length = Math.floor(Number(lineLength));
+    return Number.isFinite(length) && length >= 1 ? length : 76;
+}
+/**
+ * Splits the bytes of `src` into lines of `lineLength` bytes, each followed by a line break. With
+ * `final` set the last line, which may be shorter, gets no line break; otherwise only complete
+ * lines are taken and the rest is left for the caller
+ *
+ * @param src Bytes to wrap
+ * @param lineLength Line length
+ * @param final Whether `src` ends the output
+ * @returns The wrapped bytes and the number of trailing bytes not taken
+ */
+function wrapBuffer(src, lineLength, final) {
+    const lines = Math.ceil(src.length / lineLength);
+    // the last line waits for more data unless this is the end: whether it gets a line break
+    // depends on whether anything follows it
+    const complete = Math.max(lines - 1, 0);
+    let rest = src.length - complete * lineLength;
+    const output = Buffer.allocUnsafe(complete * (lineLength + 2) + (final ? rest : 0));
+    let to = 0;
+    for (let from = 0; from < complete * lineLength; from += lineLength) {
+        src.copy(output, to, from, from + lineLength);
+        to += lineLength;
+        output[to++] = 0x0d;
+        output[to++] = 0x0a;
+    }
+    if (final) {
+        to += src.copy(output, to, complete * lineLength);
+        rest = 0;
+    }
+    if (to !== output.length) {
+        // never hand out bytes of the unfilled allocation
+        throw new Error('Unexpected wrapped length');
+    }
+    return { output, rest };
+}
+/**
  * Adds soft line breaks to a base64 string
  *
  * @param str base64 encoded string that might need line wrapping
@@ -42930,7 +43219,8 @@ function base64_encode(buffer) {
  */
 function wrap(str, lineLength) {
     str = (str || '').toString();
-    lineLength = lineLength || 76;
+    // a negative length would step backwards through the input and never finish
+    lineLength = Math.max(Number(lineLength) || 76, 1);
     if (str.length <= lineLength) {
         return str;
     }
@@ -42948,6 +43238,9 @@ function wrap(str, lineLength) {
 /**
  * Creates a transform stream for encoding data to base64 encoding
  *
+ * The output is the same as `wrap(encode(input), lineLength)` no matter how the input is split
+ * into chunks: every line but the last one ends with a line break, the last one does not
+ *
  * @constructor
  * @param options Stream options
  * @param [options.lineLength=76] Maximum length for lines, set to false to disable wrapping
@@ -42957,66 +43250,61 @@ class Encoder extends external_node_stream_.Transform {
         super();
         this.options = options || {};
         if (this.options.lineLength !== false) {
-            this.options.lineLength = this.options.lineLength || 76;
+            this.options.lineLength = normalizeLineLength(this.options.lineLength);
         }
         this._curLine = '';
         this._remainingBytes = false;
         this.inputBytes = 0;
         this.outputBytes = 0;
     }
+    /**
+     * Emits the encoded characters `b64` that follow the current line, keeping what can not be
+     * emitted yet as the new current line
+     *
+     * @internal
+     */
+    _emit(b64, final) {
+        const src = Buffer.from(this._curLine + b64, 'latin1');
+        if (!src.length) {
+            return;
+        }
+        let output = src;
+        if (this.options.lineLength) {
+            const wrapped = wrapBuffer(src, this.options.lineLength, final);
+            output = wrapped.output;
+            this._curLine = wrapped.rest ? src.toString('latin1', src.length - wrapped.rest) : '';
+        }
+        else {
+            this._curLine = '';
+        }
+        if (output.length) {
+            this.outputBytes += output.length;
+            this.push(output);
+        }
+    }
     /** @internal */
     _transform(chunk, encoding, done) {
         let buf = encoding !== 'buffer' ? Buffer.from(chunk, encoding) : chunk;
         if (!buf || !buf.length) {
-            setImmediate(done);
-            return;
+            return done();
         }
         this.inputBytes += buf.length;
-        if (this._remainingBytes && this._remainingBytes.length) {
+        if (this._remainingBytes) {
             buf = Buffer.concat([this._remainingBytes, buf], this._remainingBytes.length + buf.length);
             this._remainingBytes = false;
         }
-        if (buf.length % 3) {
-            this._remainingBytes = buf.slice(buf.length - (buf.length % 3));
-            buf = buf.slice(0, buf.length - (buf.length % 3));
+        const extra = buf.length % 3;
+        if (extra) {
+            this._remainingBytes = buf.subarray(buf.length - extra);
+            buf = buf.subarray(0, buf.length - extra);
         }
-        else {
-            this._remainingBytes = false;
-        }
-        let b64 = this._curLine + base64_encode(buf);
-        if (this.options.lineLength) {
-            b64 = wrap(b64, this.options.lineLength);
-            // remove last line as it is still most probably incomplete
-            const lastLF = b64.lastIndexOf('\n');
-            if (lastLF < 0) {
-                this._curLine = b64;
-                b64 = '';
-            }
-            else if (lastLF === b64.length - 1) {
-                this._curLine = '';
-            }
-            else {
-                this._curLine = b64.substring(lastLF + 1);
-                b64 = b64.substring(0, lastLF + 1);
-            }
-        }
-        if (b64) {
-            this.outputBytes += b64.length;
-            this.push(Buffer.from(b64, 'ascii'));
-        }
-        setImmediate(done);
+        this._emit(base64_encode(buf), false);
+        done();
     }
     /** @internal */
     _flush(done) {
-        if (this._remainingBytes && this._remainingBytes.length) {
-            this._curLine += base64_encode(this._remainingBytes);
-        }
-        if (this._curLine) {
-            this._curLine = wrap(this._curLine, this.options.lineLength);
-            this.outputBytes += this._curLine.length;
-            this.push(Buffer.from(this._curLine, 'ascii'));
-            this._curLine = '';
-        }
+        this._emit(this._remainingBytes ? base64_encode(this._remainingBytes) : '', true);
+        this._remainingBytes = false;
         done();
     }
 }
@@ -43029,6 +43317,8 @@ class Encoder extends external_node_stream_.Transform {
  * @param buffer Buffer to convert
  * @returns Quoted-Printable encoded string
  */
+// the shortest line wrap() can make progress with: a complete =XX sequence and the soft break
+const MIN_LINE_LENGTH = 4;
 // usable characters that do not need encoding
 // https://tools.ietf.org/html/rfc2045#section-6.7
 const QP_RANGES = [
@@ -43038,23 +43328,46 @@ const QP_RANGES = [
     [0x20, 0x3c], // <SP>!"#$%&'()*+,-./0123456789:;
     [0x3e, 0x7e] // >?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}
 ];
+// 1 for every byte value that is written as is, see QP_RANGES
+const QP_LITERAL = new Uint8Array(256);
+for (let i = 0; i < 256; i++) {
+    QP_LITERAL[i] = checkRanges(i, QP_RANGES) ? 1 : 0;
+}
+const HEX_DIGITS = Buffer.from('0123456789ABCDEF', 'latin1');
+const isWhitespace = (c) => c === 0x20 || c === 0x09;
 function qp_encode(buffer) {
-    if (typeof buffer === 'string') {
-        buffer = Buffer.from(buffer, 'utf-8');
-    }
-    let result = '';
-    let ord;
-    for (let i = 0, len = buffer.length; i < len; i++) {
-        ord = buffer[i];
+    return encodeBytes(typeof buffer === 'string' ? Buffer.from(buffer, 'utf-8') : buffer);
+}
+/**
+ * Encodes bytes that may be followed by more input
+ *
+ * @param buffer Bytes to encode
+ * @param [next] The byte that follows the buffer, whitespace before it is kept literal unless it
+ *        is a line break. Without it the buffer ends the input and its trailing whitespace is encoded
+ * @param [binary] Keep only CRLF pairs literal. A lone CR or LF is data, not a line break, and
+ *        anything that rewrites line endings on the way would change it
+ * @param [previous] The byte before the buffer, for a buffer that starts with LF
+ * @returns Quoted-Printable encoded string
+ */
+function encodeBytes(buffer, next, binary, previous) {
+    const len = buffer.length;
+    // every byte takes three characters at most
+    const output = Buffer.allocUnsafe(len * 3);
+    let pos = 0;
+    for (let i = 0; i < len; i++) {
+        const ord = buffer[i];
+        const following = i + 1 < len ? buffer[i + 1] : next;
+        const lineBreakByte = binary && (ord === 0x0d || ord === 0x0a) ? (ord === 0x0d ? following === 0x0a : (i > 0 ? buffer[i - 1] : previous) === 0x0d) : true;
         // if the char is in allowed range, then keep as is, unless it is a WS in the end of a line
-        if (checkRanges(ord, QP_RANGES) &&
-            !((ord === 0x20 || ord === 0x09) && (i === len - 1 || buffer[i + 1] === 0x0a || buffer[i + 1] === 0x0d))) {
-            result += String.fromCharCode(ord);
+        if (QP_LITERAL[ord] && lineBreakByte && !(isWhitespace(ord) && (following === undefined || following === 0x0a || following === 0x0d))) {
+            output[pos++] = ord;
             continue;
         }
-        result += '=' + (ord < 0x10 ? '0' : '') + ord.toString(16).toUpperCase();
+        output[pos++] = 0x3d; // =
+        output[pos++] = HEX_DIGITS[Math.floor(ord / 16)];
+        output[pos++] = HEX_DIGITS[ord % 16];
     }
-    return result;
+    return output.toString('latin1', 0, pos);
 }
 /**
  * Adds soft line breaks to a Quoted-Printable string
@@ -43065,7 +43378,9 @@ function qp_encode(buffer) {
  */
 function qp_wrap(str, lineLength) {
     str = (str || '').toString();
-    lineLength = lineLength || 76;
+    // a line has to hold a complete =XX sequence plus the soft break, shorter lengths
+    // (or a negative one) would loop without consuming input
+    lineLength = Math.max(Number(lineLength) || 76, MIN_LINE_LENGTH);
     if (str.length <= lineLength) {
         return str;
     }
@@ -43105,10 +43420,7 @@ function qp_wrap(str, lineLength) {
                 line = line.substr(0, line.length - match[0].length);
             }
             // ensure that utf-8 sequences are not split
-            while (line.length > 3 &&
-                line.length < len - pos &&
-                !line.match(/^(?:=[\da-f]{2}){1,4}$/i) &&
-                (match = line.match(/[=][\da-f]{2}$/gi))) {
+            while (line.length > 3 && line.length < len - pos && !line.match(/^(?:=[\da-f]{2}){1,4}$/i) && (match = line.match(/[=][\da-f]{2}$/gi))) {
                 code = parseInt(match[0].substr(1, 2), 16);
                 if (code < 128) {
                     break;
@@ -43118,6 +43430,11 @@ function qp_wrap(str, lineLength) {
                     break;
                 }
             }
+        }
+        if (!line.length) {
+            // the trimming above emptied the line, which only happens for an incomplete
+            // escape at the very end of the input. Take it as is rather than loop on it
+            line = str.substr(pos, lineLength);
         }
         if (pos + line.length < len && line.substr(-1) !== '\n') {
             if (line.length === lineLength && line.match(/[=][\da-f]{2}$/i)) {
@@ -43158,6 +43475,10 @@ function checkRanges(nr, ranges) {
     }
     return false;
 }
+// Input is encoded and wrapped this many bytes at a time. wrap() works on strings, and a large
+// chunk handed over at once, such as a whole Buffer attachment, would be held several times over
+// as intermediate strings
+const ENCODE_SLICE_SIZE = 64 * 1024;
 /**
  * Creates a transform stream for encoding data to Quoted-Printable encoding
  *
@@ -43173,45 +43494,82 @@ class qp_Encoder extends external_node_stream_.Transform {
             this.options.lineLength = this.options.lineLength || 76;
         }
         this._curLine = '';
+        this._remainingBytes = false;
+        this._lastByte = undefined;
         this.inputBytes = 0;
         this.outputBytes = 0;
     }
     /** @internal */
     _transform(chunk, encoding, done) {
-        let qp;
-        if (encoding !== 'buffer') {
-            chunk = Buffer.from(chunk, encoding);
-        }
-        if (!chunk || !chunk.length) {
+        let buf = encoding !== 'buffer' ? Buffer.from(chunk, encoding) : chunk;
+        if (!buf || !buf.length) {
             return done();
         }
-        this.inputBytes += chunk.length;
-        if (this.options.lineLength) {
-            qp = this._curLine + qp_encode(chunk);
-            qp = qp_wrap(qp, this.options.lineLength);
-            qp = qp.replace(/(^|\n)([^\n]*)$/, (match, lineBreak, lastLine) => {
-                this._curLine = lastLine;
-                return lineBreak;
-            });
-            if (qp) {
-                this.outputBytes += qp.length;
-                this.push(qp);
-            }
+        this.inputBytes += buf.length;
+        if (this._remainingBytes) {
+            buf = Buffer.concat([this._remainingBytes, buf], this._remainingBytes.length + buf.length);
+            this._remainingBytes = false;
         }
-        else {
-            qp = qp_encode(chunk);
-            this.outputBytes += qp.length;
-            this.push(qp, 'ascii');
+        // Whitespace is encoded when it ends a line, and the end of the input counts as one. Hold
+        // back the whitespace a chunk ends with until it is known what follows it, so the output
+        // does not depend on where the input was split
+        let end = buf.length;
+        // a binary CR can only be written once it is known whether LF follows
+        while (end > 0 && (isWhitespace(buf[end - 1]) || (this.options.binary && buf[end - 1] === 0x0d))) {
+            end--;
         }
+        if (buf.length - end <= ENCODE_SLICE_SIZE) {
+            this._remainingBytes = end < buf.length ? Buffer.from(buf.subarray(end)) : false;
+            buf = buf.subarray(0, end);
+        }
+        this._encodeSlices(buf);
         done();
     }
     /** @internal */
     _flush(done) {
+        if (this._remainingBytes) {
+            this._encodeSlices(this._remainingBytes);
+            this._remainingBytes = false;
+        }
         if (this._curLine) {
             this.outputBytes += this._curLine.length;
             this.push(this._curLine, 'ascii');
+            this._curLine = '';
         }
         done();
+    }
+    /**
+     * Encodes the input in slices of ENCODE_SLICE_SIZE bytes. Each slice is told the byte that
+     * follows it, so a slice that ends in whitespace is encoded as if it was not split
+     *
+     * @internal
+     */
+    _encodeSlices(buf) {
+        for (let start = 0; start < buf.length; start += ENCODE_SLICE_SIZE) {
+            const end = Math.min(start + ENCODE_SLICE_SIZE, buf.length);
+            this._encodeSlice(buf.subarray(start, end), end < buf.length ? buf[end] : undefined);
+            this._lastByte = buf[end - 1];
+        }
+    }
+    /** @internal */
+    _encodeSlice(buf, next) {
+        let qp;
+        if (this.options.lineLength) {
+            qp = qp_wrap(this._curLine + encodeBytes(buf, next, this.options.binary, this._lastByte), this.options.lineLength);
+            // the last line is kept until it is known whether it needs a soft break
+            const lastLF = qp.lastIndexOf('\n');
+            this._curLine = qp.substring(lastLF + 1);
+            qp = qp.substring(0, lastLF + 1);
+            if (qp) {
+                this.outputBytes += qp.length;
+                this.push(qp, 'ascii');
+            }
+        }
+        else {
+            qp = encodeBytes(buf, next, this.options.binary, this._lastByte);
+            this.outputBytes += qp.length;
+            this.push(qp, 'ascii');
+        }
     }
 }
 
@@ -43239,6 +43597,12 @@ function isPlainText(value, isParam) {
     const re = isParam ? /[\x00-\x1f\x7f"\u0080-\uFFFF]/ : /[\x00-\x08\x0b\x0c\x0e-\x1f\u0080-\uFFFF]/;
     return typeof value === 'string' && !re.test(value);
 }
+// A parameter value goes out as is only when it is plain text that does not look like an encoded
+// word. Receivers decode encoded words found in parameter values (libmime does so for unencoded
+// continuations), so as plain text it would come back as something else
+function isPlainParamValue(value) {
+    return isPlainText(value, true) && !value.includes('=?');
+}
 /**
  * Wraps a value into a quoted-string. Inside one a quote would end the string early
  * and a backslash would escape whatever follows it, so both go out as quoted-pairs.
@@ -43257,6 +43621,7 @@ function quoteString(value) {
  * no need to encode the values in any way. If the value is plaintext but has
  * longer lines then allowed, then use format=flowed
  *
+ * @param str Multi line string to check
  * @param lineLength Max line length to check for
  * @returns Returns true if there is at least one line longer than lineLength chars
  */
@@ -43354,26 +43719,38 @@ function encodeWord(data, mimeWordEncoding, maxLength) {
  */
 function encodeWords(value, mimeWordEncoding, maxLength, encodeAll) {
     maxLength = maxLength || 0;
-    // find first word with a non-printable ascii or special symbol in it
-    const firstMatch = value.match(/(?:^|\s)([^\s]*["\u0080-\uFFFF])/);
-    if (!firstMatch) {
+    // find the first and the last character that needs encoding, a quote or anything outside
+    // printable ascii. A scan rather than a regex: matching the last such word with a
+    // backtracking pattern took quadratic time on a long word of non-ascii characters
+    let firstSpecial = -1;
+    let lastSpecial = -1;
+    for (let i = 0; i < value.length; i++) {
+        const code = value.charCodeAt(i);
+        if (code === 0x22 || code >= 0x80) {
+            if (firstSpecial < 0) {
+                firstSpecial = i;
+            }
+            lastSpecial = i;
+        }
+    }
+    if (firstSpecial < 0) {
         return value;
     }
     if (encodeAll) {
         // if it is requested to encode everything or the string contains something that resebles encoded word, then encode everything
         return encodeWord(value, mimeWordEncoding, maxLength);
     }
-    // find the last word with a non-printable ascii in it
-    const lastMatch = value.match(/(["\u0080-\uFFFF][^\s]*)[^"\u0080-\uFFFF]*$/);
-    if (!lastMatch) {
-        // should not happen
-        return value;
+    // encode from the start of the word holding the first such character to the end of the
+    // word holding the last one, so the encoded words stay separated from the plain text by
+    // the whitespace that was already there
+    let startIndex = firstSpecial;
+    while (startIndex > 0 && !/\s/.test(value.charAt(startIndex - 1))) {
+        startIndex--;
     }
-    const startIndex = firstMatch.index +
-        (firstMatch[0].match(/[^\s]/) || {
-            index: 0
-        }).index;
-    const endIndex = lastMatch.index + (lastMatch[1] || '').length;
+    let endIndex = lastSpecial + 1;
+    while (endIndex < value.length && !/\s/.test(value.charAt(endIndex))) {
+        endIndex++;
+    }
     return ((startIndex ? value.substr(0, startIndex) : '') +
         encodeWord(value.substring(startIndex, endIndex), mimeWordEncoding || 'Q', maxLength) +
         (endIndex < value.length ? value.substr(endIndex) : ''));
@@ -43393,7 +43770,7 @@ function buildHeaderValue(structured) {
         const value = structured.params[key];
         // a parameter name is a token too and it is emitted without any quoting around it
         const param = key.replace(/[\x00-\x1f\x7f]/g, '');
-        if (!isPlainText(value, true) || value.length >= 75) {
+        if (!isPlainParamValue(value) || value.length >= 75) {
             buildHeaderParam(param, value, 50).forEach(encodedParam => {
                 if (!/[\s"\\;:/=(),<>@[\]?]|^[-']|'$/.test(encodedParam.value) || encodedParam.key.substr(-1) === '*') {
                     paramsArray.push(encodedParam.key + '=' + encodedParam.value);
@@ -43403,7 +43780,10 @@ function buildHeaderValue(structured) {
                 }
             });
         }
-        else if (/[\s'"\\;:/=(),<>@[\]?]|^-/.test(value)) {
+        else if (!value.length || /[\s'"\\;:/=(),<>@[\]?]|^-/.test(value)) {
+            // a parameter value is a token or a quoted-string and a token is never empty, so
+            // a valueless parameter such as the 'flag' of 'multipart/mixed; flag; boundary=b'
+            // goes out as 'flag=""' rather than as the 'flag=' that parses as neither
             paramsArray.push(param + '=' + JSON.stringify(value));
         }
         else {
@@ -43425,9 +43805,9 @@ function buildHeaderValue(structured) {
  *     title*0*=utf-8''unicode
  *     title*1*=%20string
  *
+ * @param key Parameter name the generated keys are built from, for example title
  * @param data String to be encoded
  * @param [maxLength=50] Max length for generated chunks
- * @param [fromCharset='UTF-8'] Source sharacter set
  * @return A list of encoded keys and headers
  */
 function buildHeaderParam(key, data, maxLength) {
@@ -43439,7 +43819,7 @@ function buildHeaderParam(key, data, maxLength) {
     let i, len;
     maxLength = maxLength || 50;
     // process ascii only text
-    if (isPlainText(data, true)) {
+    if (isPlainParamValue(data)) {
         // check if conversion is even needed
         if (encodedStr.length <= maxLength) {
             return [
@@ -43555,6 +43935,46 @@ function buildHeaderParam(key, data, maxLength) {
     }));
 }
 /**
+ * An RFC 2045 token: printable ASCII without SPACE, the control characters, DEL and the
+ * tspecials. A charset name is one, and the name a continuation carries is written into
+ * the encoded word the parameter value becomes, so it is checked against this before it
+ * goes in. Whitespace used to come off it only because the value was trimmed first.
+ */
+const TOKEN = /^[^\x00-\x20\x7f()<>@,;:\\"/[\]?=]+$/;
+/**
+ * Offset of the ')' that closes the RFC 822 comment opening at `start`, or -1 when the
+ * comment never closes. Comments nest, and a backslash escapes the character after it
+ */
+function _findCommentEnd(str, start) {
+    let depth = 0;
+    for (let i = start, len = str.length; i < len; i++) {
+        const c = str.charAt(i);
+        if (c === '\\') {
+            i++;
+        }
+        else if (c === '(') {
+            depth++;
+        }
+        else if (c === ')' && --depth === 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+/**
+ * Whether a string can be a header parameter name.
+ *
+ * A parameter name is a token, so it is never empty. A "__proto__" name would target the
+ * prototype chain of the params object instead of an own property of it and read back as
+ * Object.prototype, so it is no name either.
+ *
+ * @param name Candidate parameter name, already lowercased
+ * @return true when the name can be used
+ */
+function _isParamName(name) {
+    return !!name && !isProtoKey(name);
+}
+/**
  * Parses a header value with key=value arguments into a structured
  * object.
  *
@@ -43567,140 +43987,252 @@ function buildHeaderParam(key, data, maxLength) {
  *   }
  *
  * @param str Header value
+ * @param options Options, see ParseHeaderValueOptions
  * @return Header value as a parsed structure
  */
-function parseHeaderValue(str) {
+function parseHeaderValue(str, options) {
     const response = {
-        value: false,
+        value: '',
         params: {}
     };
-    // Parameter names come from a caller supplied contentType/contentDisposition. A
-    // "__proto__" name would target the prototype chain of the params object instead of
-    // an own property of it, and read back as Object.prototype, so it is dropped.
+    // Cleared again by an unclosed '(', see the loop
+    let stripComments = !!options?.stripComments;
+    // A duplicated parameter resolves to its first occurrence, the way a duplicated header
+    // does. Letting the last one win disagrees with the receivers that take the first, and
+    // the two readings of 'boundary="b"; boundary="c"' name different delimiters. The
+    // continuation join below is the only writer of the name it builds, so it tests the
+    // name with _isParamName directly rather than taking that rule along from here.
     const setParam = (name, value) => {
-        if (!isProtoKey(name)) {
+        name = name.toLowerCase();
+        if (_isParamName(name) && !Object.prototype.hasOwnProperty.call(response.params, name)) {
             response.params[name] = value;
         }
     };
     let key = false;
     let value = '';
-    let type = 'value';
+    let stage = 'value';
     let quote = false;
     let escaped = false;
     let chr;
+    // Whitespace seen outside a quoted string is held back until a significant character
+    // follows it, so the whitespace around a value is dropped without trimming spaces the
+    // sender quoted on purpose. Trimming the stored value instead loses the trailing space
+    // of 'filename*0="Annual Report "', which the next continuation section is appended to.
+    let pendingSpace = '';
+    let quoteClosed = false;
+    // Whitespace ahead of the first character of a value is padding and is dropped, the
+    // whitespace between two characters of it is content
+    const flushSpace = () => {
+        if (value.length) {
+            value += pendingSpace;
+        }
+        pendingSpace = '';
+    };
+    const addChr = (c) => {
+        flushSpace();
+        value += c;
+    };
+    const takeValue = () => {
+        const taken = value;
+        value = '';
+        pendingSpace = '';
+        quoteClosed = false;
+        return taken;
+    };
+    const storeValue = () => {
+        const taken = takeValue();
+        if (key === false) {
+            response.value = taken;
+        }
+        else {
+            setParam(key, taken);
+        }
+    };
+    // A parameter name with no '=' is a valueless parameter, not the start of the next one.
+    // Without this the name keeps growing across the ';' and swallows whatever follows, which
+    // is how 'multipart/mixed; flag; boundary="AAA"' lost its boundary to a parameter named
+    // 'flag; boundary' and left the node declaring the generated boundary beside the asked
+    // for one, so a receiver reading the first of the two found no delimiter it matched.
+    const storeEmptyKey = () => {
+        setParam(takeValue().trim(), '');
+    };
     for (let i = 0, len = str.length; i < len; i++) {
         chr = str.charAt(i);
-        if (type === 'key') {
+        // With stripComments, an RFC 822 comment stands anywhere outside a quoted string but
+        // right behind a token it would continue, see ParseHeaderValueOptions. In the value
+        // of a parameter, no pending whitespace means the last significant character was the
+        // '=' or a character of the token
+        if (stripComments && chr === '(' && !quote && !quoteClosed && !(stage === 'value' && key !== false && !pendingSpace)) {
+            let end = _findCommentEnd(str, i);
+            if (end < 0 && str.indexOf(';', i) < 0) {
+                // a comment that never closes runs to the end of the value, unless a
+                // parameter follows it, which is content then and survives
+                end = len - 1;
+            }
+            if (end >= 0) {
+                i = end;
+                continue;
+            }
+            // looking for a closing ')' again would scan a run of unclosed '(' to its end
+            // once for each of them
+            stripComments = false;
+        }
+        if (stage === 'key') {
             if (chr === '=') {
-                key = value.trim().toLowerCase();
-                type = 'value';
-                value = '';
+                key = takeValue().trim();
+                stage = 'value';
+                continue;
+            }
+            if (chr === ';') {
+                storeEmptyKey();
                 continue;
             }
             value += chr;
         }
         else {
-            if (escaped) {
-                value += chr;
+            if (quoteClosed && chr !== ';') {
+                // Nothing behind a closed quoted string reaches the value. RFC 2045 says a
+                // parameter value is a token or a quoted string and not both, so what follows
+                // one is junk and only the ';' that ends the parameter still counts. Tested
+                // ahead of the branches rather than beside the append at the foot of them,
+                // where each branch above was a way around it: a second '"' reopened quoting
+                // and swallowed the rest of the header, so 'boundary="AAA" "; boundary=BBB"'
+                // read as a single boundary of 'AAA ', and the junk of
+                // 'boundary="AAA" (unterminated comment' still joined the declared boundary
+                // through the escape branch. quoteClosed is only ever set while no quote is
+                // open, and this is what keeps one from being opened afterwards.
+                escaped = false;
+                continue;
             }
-            else if (chr === '\\') {
+            if (escaped) {
+                addChr(chr);
+            }
+            else if (quote && chr === '\\') {
+                // a backslash only escapes inside a quoted string, everywhere else it is an
+                // ordinary character. Treating it as an escape turns the parameter value
+                // 'C:\Users\me\report.txt' into 'C:Usersmereport.txt'
                 escaped = true;
                 continue;
             }
             else if (quote && chr === quote) {
                 quote = false;
+                quoteClosed = true;
             }
             else if (!quote && chr === '"') {
                 quote = chr;
+                flushSpace();
             }
             else if (!quote && chr === ';') {
-                if (key === false) {
-                    response.value = value.trim();
-                }
-                else {
-                    setParam(key, value.trim());
-                }
-                type = 'key';
-                value = '';
+                storeValue();
+                stage = 'key';
+            }
+            else if (!quote && (chr === ' ' || chr === '\t')) {
+                pendingSpace += chr;
             }
             else {
-                value += chr;
+                addChr(chr);
             }
             escaped = false;
         }
     }
-    if (type === 'value') {
-        if (key === false) {
-            response.value = value.trim();
-        }
-        else {
-            setParam(key, value.trim());
-        }
+    if (stage === 'value') {
+        storeValue();
     }
-    else if (value.trim()) {
-        setParam(value.trim().toLowerCase(), '');
+    else {
+        // a key with no value, as in 'Header-Key: somevalue; key=value; emptykey'
+        storeEmptyKey();
     }
     // handle parameter value continuations
     // https://tools.ietf.org/html/rfc2231#section-3
-    // preprocess values
+    // Sections are collected in a list and ordered below rather than written into an array
+    // at their own section number. An index write makes the array as long as the number the
+    // header asked for, and the join that follows walks all of it, so the 55 byte value
+    // "attachment; filename*0*=utf-8''a; filename*4000000000=b" held a core for over two
+    // minutes.
+    const continuations = new Map();
     Object.keys(response.params).forEach(key => {
-        let actualKey, nr, match, value;
-        if ((match = key.match(/(\*(\d+)|\*(\d+)\*|\*)$/))) {
-            actualKey = key.substr(0, match.index);
-            nr = Number(match[2] || match[3]) || 0;
-            if (isProtoKey(actualKey)) {
-                // see setParam. Reading it back would yield Object.prototype, which is
-                // an object, so the initializer below would be skipped and the write
-                // that follows would throw out of a header build the caller can not catch
-                delete response.params[key];
-                return;
-            }
-            if (!response.params[actualKey] || typeof response.params[actualKey] !== 'object') {
-                response.params[actualKey] = {
-                    charset: false,
-                    values: []
-                };
-            }
-            value = response.params[key];
-            if (nr === 0 && match[0].substr(-1) === '*' && (match = value.match(/^([^']*)'[^']*'(.*)$/))) {
-                response.params[actualKey].charset = match[1] || 'iso-8859-1';
-                value = match[2];
-            }
-            response.params[actualKey].values[nr] = value;
-            // remove the old reference
-            delete response.params[key];
+        const match = key.match(/(\*(\d+)|\*(\d+)\*|\*)$/);
+        if (!match) {
+            // not a continuation parameter, there is nothing to join
+            return;
         }
+        const actualKey = key.substr(0, match.index);
+        const nr = Number(match[2] || match[3]) || 0;
+        // RFC 2231 section 4.1: only a section whose name ends in '*' is percent encoded
+        const encoded = match[0].substr(-1) === '*';
+        // remove the old reference
+        let value = response.params[key];
+        delete response.params[key];
+        if (!_isParamName(actualKey)) {
+            // the joined value can not be written back under this name. It is empty when the
+            // continuation suffix was all there was of it, as in the bare '*' of 'text/plain; a;*'
+            return;
+        }
+        let continuation = continuations.get(actualKey);
+        if (!continuation) {
+            continuation = { charset: false, sections: [] };
+            continuations.set(actualKey, continuation);
+        }
+        const charsetMatch = nr === 0 && encoded ? value.match(/^([^']*)'[^']*'(.*)$/) : null;
+        if (charsetMatch) {
+            // the charset is a token, and anything else named as one is no charset a consumer
+            // could resolve, so it reads as the unnamed case rather than being carried into
+            // the encoded word below. A "\r\n" of a prefix would otherwise reach a consumer
+            // of the parsed value as the charset of a word that no decoder can act on
+            continuation.charset = TOKEN.test(charsetMatch[1]) ? charsetMatch[1] : 'iso-8859-1';
+            value = charsetMatch[2];
+        }
+        continuation.sections.push({ nr, value, encoded });
     });
     // concatenate split rfc2231 strings and convert encoded strings to mime encoded words
-    Object.keys(response.params).forEach(key => {
-        let value;
-        if (response.params[key] && Array.isArray(response.params[key].values)) {
-            value = response.params[key].values.map((val) => val || '').join('');
-            if (response.params[key].charset) {
-                // convert "%AB" to "=?charset?Q?=AB?="
-                response.params[key] =
-                    '=?' +
-                        response.params[key].charset +
-                        '?Q?' +
-                        value
-                            // fix invalidly encoded chars
-                            .replace(/[=?_\s]/g, s => {
-                            const c = s.charCodeAt(0).toString(16);
-                            if (s === ' ') {
-                                return '_';
-                            }
-                            return '%' + (c.length < 2 ? '0' : '') + c;
-                        })
-                            // change from urlencoding to percent encoding
-                            .replace(/%/g, '=') +
-                        '?=';
-            }
-            else {
-                response.params[key] = value;
-            }
+    continuations.forEach((continuation, key) => {
+        if (Object.prototype.hasOwnProperty.call(response.params, key)) {
+            // The same name was also given as a plain parameter, which the starred keys were
+            // just deleted from around, so this write would be the only one in the function
+            // to override a name already taken. 'filename=plain.txt; filename*0=evil.txt'
+            // resolves to the plain parameter either way round, so the reading does not come
+            // down to which of the two spellings the sender put first
+            return;
         }
+        continuation.sections.sort((a, b) => a.nr - b.nr);
+        if (!continuation.charset) {
+            // nothing said which charset the percent escapes of an encoded section are in,
+            // so every section is passed on as the text it already is
+            response.params[key] = continuation.sections.map(section => section.value).join('');
+            return;
+        }
+        // convert "%AB" to "=?charset?Q?=AB?="
+        response.params[key] = '=?' + continuation.charset + '?Q?' + continuation.sections.map(_encodeContinuationSection).join('') + '?=';
     });
     return response;
+}
+/**
+ * Renders one parameter value continuation section as the payload of a Q encoded word.
+ *
+ * A section whose name ends in '*' is percent encoded and its escapes carry the bytes of
+ * the value, so they only have to be rewritten into the "=AB" spelling a Q encoded word
+ * uses. A section without the '*' is literal text (RFC 2231 section 4.1), so its '%' is a
+ * '%' and is escaped along with the characters a Q encoded word can not carry bare.
+ * Decoding a literal section invents bytes that never appeared on the wire: it is how the
+ * value 'filename*0*=utf-8''safe; filename*1=%2F..%2F..%2Fetc%2Fpasswd' was emitted as a
+ * filename every receiving client reads back as 'safe/../../etc/passwd'.
+ *
+ * @param section One collected continuation section
+ * @return The section as Q encoded word payload
+ */
+function _encodeContinuationSection(section) {
+    const specials = section.encoded ? /[=?_\s]/g : /[=?_\s%]/g;
+    return (section.value
+        // fix invalidly encoded chars
+        .replace(specials, s => {
+        const c = s.charCodeAt(0).toString(16);
+        if (s === ' ') {
+            return '_';
+        }
+        return '%' + (c.length < 2 ? '0' : '') + c;
+    })
+        // change from urlencoding to percent encoding
+        .replace(/%/g, '='));
 }
 /**
  * Returns file extension for a content type string. If no suitable extensions
@@ -43842,6 +44374,100 @@ function safeEncodeURIComponent(str) {
 }
 
 ;// CONCATENATED MODULE: ./node_modules/nodemailer/dist/esm/addressparser/index.js
+/* eslint-disable no-bitwise -- the kind of a token is a set of bit flags packed into one slot of a typed array */
+/** The token is an operator, a text run otherwise */
+const TOKEN_OPERATOR = 1;
+/** The next character continues the same run without whitespace in between */
+const TOKEN_NO_BREAK = 2;
+/** The text run holds characters its value leaves out or changes, so it is no plain slice */
+const TOKEN_DIRTY = 4;
+/** A backslash escapes the next character in the text run, inside a quoted string or a comment */
+const TOKEN_ESCAPES = 8;
+/** The text run opens on a character an escaping backslash in front of it has escaped */
+const TOKEN_STARTS_ESCAPED = 16;
+/**
+ * The tokens of an address field, kept as offsets into it.
+ *
+ * Every token used to be an object of its own, an operator for every ',' and a value string
+ * for every run of text, and a list of one letter names, 'a,a,a,...', took some 65 times its
+ * size in tokens before any address was read. A token is now three numbers in one typed
+ * array, its kind and the range of the field it covers, and its value is sliced off the field
+ * when it is read. The few text runs whose value differs from their slice, as they hold an
+ * escaping backslash, a line break or a control character, are rebuilt once and kept aside.
+ */
+class TokenList {
+    constructor(str) {
+        this.str = str;
+        this.slots = new Int32Array(48);
+        this.length = 0;
+        this.cleaned = new Map();
+    }
+    /**
+     * Appends a token
+     *
+     * @param kind Kind and flags of the token
+     * @param start Offset of its first character
+     * @param end Offset just past its last character
+     * @return Index of the token
+     */
+    push(kind, start, end) {
+        if ((this.length + 1) * 3 > this.slots.length) {
+            const grown = new Int32Array(this.slots.length * 2);
+            grown.set(this.slots);
+            this.slots = grown;
+        }
+        const at = this.length * 3;
+        this.slots[at] = kind;
+        this.slots[at + 1] = start;
+        this.slots[at + 2] = end;
+        return this.length++;
+    }
+    /**
+     * The character of an operator token, an empty string for a text run
+     */
+    operatorAt(index) {
+        const at = index * 3;
+        return this.slots[at] & TOKEN_OPERATOR ? this.str.charAt(this.slots[at + 1]) : '';
+    }
+    /**
+     * Whether a token is an operator
+     */
+    isOperator(index) {
+        return (this.slots[index * 3] & TOKEN_OPERATOR) !== 0;
+    }
+    /**
+     * Whether the next character continues the run of a token without whitespace in between
+     */
+    noBreak(index) {
+        return (this.slots[index * 3] & TOKEN_NO_BREAK) !== 0;
+    }
+    /**
+     * Value of a token
+     */
+    value(index) {
+        const cleaned = this.cleaned.get(index);
+        if (cleaned !== undefined) {
+            return cleaned;
+        }
+        return this.str.slice(this.slots[index * 3 + 1], this.slots[index * 3 + 2]);
+    }
+}
+/**
+ * A domain literal that ends an address. dtext includes '@' (RFC 5322 3.4.1), so the '@'
+ * in front of the literal is the one that splits the domain off, not the last one: reading
+ * 'a@[x@evil.com]' at its last '@' made it an address at evil.com.
+ */
+const DOMAIN_LITERAL_TAIL = /@(\[[^[\]\\]*\])$/;
+/**
+ * Offset of the '@' that splits the domain off an address, or -1 when there is none
+ *
+ * @param address Address to split
+ * @return Offset of the '@'
+ */
+function _domainAt(address) {
+    const literal = address.charAt(address.length - 1) === ']' ? DOMAIN_LITERAL_TAIL.exec(address) : null;
+    return literal ? address.length - literal[1].length - 1 : address.lastIndexOf('@');
+}
 /**
  * Restores the quoting of a local part that was read out of a quoted string.
  *
@@ -43860,7 +44486,7 @@ function safeEncodeURIComponent(str) {
  * @return Address with the local part as a quoted-string
  */
 function _quoteLocalPart(address) {
-    const lastAt = address.lastIndexOf('@');
+    const lastAt = _domainAt(address);
     if (lastAt < 0) {
         // no domain to split off, nothing can be misrouted
         return address;
@@ -43886,6 +44512,23 @@ const QUOTED_LOCAL_ADDR = /^("(?:[^"\\]|\\[\s\S])*"@\S+)(?:\s+([\s\S]+))?$/;
  * One run holding a single '@' and no whitespace, the shape an addr-spec has to have.
  */
 const ADDR_SPEC = /^[^@\s]+@[^@\s]+$/;
+/**
+ * The same with a domain literal for the domain, which may hold an '@' of its own.
+ */
+const LITERAL_ADDR_SPEC = /^[^@\s]+@\[[^[\]\\\s]*\]$/;
+/**
+ * The '@' and domain that follow a quoted local part in the same run.
+ */
+const QUOTED_LOCAL_DOMAIN = /^@(?:[^@\s"]+|\[[^[\]\\\s]*\])$/;
+/**
+ * Whether a whitespace free run reads as an addr-spec under the strict grammar
+ *
+ * @param value Run to check
+ * @return true when it does
+ */
+function _isAddrSpec(value) {
+    return ADDR_SPEC.test(value) || LITERAL_ADDR_SPEC.test(value);
+}
 /**
  * The looser reading applied once the strict one finds nothing, which tolerates the
  * further '@' that a domain should not have but malformed headers carry anyway.
@@ -43951,6 +44594,62 @@ function _indexOfAt(text, from, to) {
         }
     }
     return -1;
+}
+/**
+ * A quoted-string a value opens with.
+ */
+const LEADING_QUOTED_STRING = /^"(?:[^"\\]|\\[\s\S])*"/;
+/**
+ * Drops the whitespace on either side of the '@' at an offset.
+ *
+ * obs-local-part and obs-domain allow CFWS around the '@' (RFC 5322 4.4), so 'user @ good.com'
+ * names user@good.com. Kept, the whitespace went into the envelope as '"user "@ good.com'.
+ * The scan is by index, a pattern such as /\s+@/ backtracks over a long whitespace run that
+ * no '@' follows.
+ *
+ * @param value Value holding the '@'
+ * @param at Offset of the '@', or -1
+ * @return The value with the whitespace beside that '@' removed
+ */
+function _joinAtSpacing(value, at) {
+    if (at < 0) {
+        return value;
+    }
+    let start = at;
+    while (start > 0 && _isSpaceCode(value.charCodeAt(start - 1))) {
+        start--;
+    }
+    let end = at + 1;
+    while (end < value.length && _isSpaceCode(value.charCodeAt(end))) {
+        end++;
+    }
+    return start === at && end === at + 1 ? value : value.slice(0, start) + '@' + value.slice(end);
+}
+/**
+ * Drops the whitespace beside the '@' that splits the domain off a value. That is the '@'
+ * right after a quoted local part the value opens with, or else the only '@' it holds outside
+ * any quoted string. With several it is not clear which one the whitespace belongs to, and
+ * '<x@evil.com @good.com>' is left to the addr-spec recovery to read as it always has.
+ *
+ * @param value Value to clean up
+ * @return The value with the whitespace beside that '@' removed
+ */
+function _collapseAtSpacing(value) {
+    const quoted = LEADING_QUOTED_STRING.exec(value);
+    if (quoted) {
+        let at = quoted[0].length;
+        while (at < value.length && _isSpaceCode(value.charCodeAt(at))) {
+            at++;
+        }
+        if (value.charAt(at) === '@' && value.indexOf('@', at + 1) < 0) {
+            return _joinAtSpacing(value, at);
+        }
+    }
+    const at = value.indexOf('@');
+    if (at < 0 || value.indexOf('@', at + 1) >= 0 || value.lastIndexOf('"') > at) {
+        return value;
+    }
+    return _joinAtSpacing(value, at);
 }
 /**
  * Finds the offset LOOSE_TEXT_ADDR matches at, or -1 when it does not match at all.
@@ -44041,6 +44740,7 @@ function _looseAddressStart(text) {
  * @param data Collected address parts, mutated in place
  */
 function _recoverAddrSpec(data) {
+    data.address = _collapseAtSpacing(data.address);
     if (!HAS_WHITESPACE.test(data.address)) {
         return;
     }
@@ -44067,7 +44767,7 @@ function _recoverAddrSpec(data) {
             return;
         }
         const parts = data.address.split(/\s+/);
-        let addrIndex = parts.findIndex(part => ADDR_SPEC.test(part));
+        let addrIndex = parts.findIndex(_isAddrSpec);
         if (addrIndex < 0) {
             addrIndex = parts.findIndex(part => LOOSE_ADDR_SPEC.test(part));
         }
@@ -44085,47 +44785,168 @@ function _recoverAddrSpec(data) {
         .join(' ');
 }
 /**
- * Converts tokens for a single address into an address object
+ * Takes the RFC 5322 comments out of the contents of an angle-addr.
  *
- * @param tokens Tokens object
- * @param depth Current recursion depth for nested group protection
- * @return Address object
+ * The tokenizer tracks a single open operator, so once '<' is open a '(' is plain text and
+ * a comment inside the brackets reached the address verbatim: 'Name <user@example.com(x)evil.com>'
+ * put 'user@example.com(x)evil.com' into the envelope, a value that is no mailbox and that a
+ * receiver stripping the comment reads as 'user@example.comevil.com' (GHSA-g73g-hqqh-jr95).
+ * A comment is folding whitespace, so it is read as a space that splits two atoms and as
+ * nothing next to an '@', the same rule the token walk applies outside the brackets. Quoted
+ * strings and domain literals are copied through untouched, a '(' in there is not a comment.
+ * An unexpected '<' outside them drops everything in front of it, comments included.
+ *
+ * RFC 822 also let an angle-addr name the relays to go through in front of the mailbox,
+ * '<@relay1,@relay2:user@example.com>', which RFC 5322 still parses as obs-route. The route
+ * is not part of the mailbox, and folded into the local part it made
+ * '"@relay1,@relay2:user"@example.com' a recipient that does not exist. A local part can not
+ * start with '@', so contents that do, up to the first ':' outside a domain literal and in
+ * front of any quoted string, are a route and are dropped, as long as a mailbox with an '@'
+ * of its own follows.
+ *
+ * @param address Contents of the angle brackets
+ * @return The address with the comments removed, and the text of the comments
  */
-function _handleAddress(tokens, depth) {
-    let isGroup = false;
+function _stripAddressComments(address) {
+    const comments = [];
+    let result = '';
+    let comment = '';
+    let depth = 0;
+    let closer = '';
+    // carried along rather than read back off the growing result, which would flatten it on
+    // every comment (see lastChars in _handleAddress)
+    let lastChar = '';
+    // A comment that just closed stands for a space, written once the next character shows
+    // whether one is wanted: not beside an '@', and not on top of whitespace that follows.
+    // Deciding on the spot saw only the character right after the ')', so a second comment
+    // in a row hid the '@' behind it and 'a(x)(y)@b' read as 'a @b'
+    let pendingSpace = false;
+    // first character of the result and whether a quoted string has opened since, which
+    // together tell a route from a local part
+    let firstChar = '';
+    let quoteSeen = false;
+    let routeEnd = -1;
+    for (let i = 0, len = address.length; i < len; i++) {
+        const chr = address.charAt(i);
+        if (depth) {
+            if (chr === '\\' && i < len - 1) {
+                comment += address.charAt(++i);
+            }
+            else if (chr === '(') {
+                depth++;
+                comment += chr;
+            }
+            else if (chr === ')' && !--depth) {
+                comments.push(comment.trim());
+                comment = '';
+                pendingSpace = lastChar !== '@';
+            }
+            else {
+                comment += chr;
+            }
+            continue;
+        }
+        if (pendingSpace && chr !== '(') {
+            pendingSpace = false;
+            if (chr !== '@' && chr !== '<' && !_isSpaceCode(address.charCodeAt(i))) {
+                result += ' ';
+                lastChar = ' ';
+            }
+        }
+        if (closer) {
+            if (chr === '\\' && closer === '"' && i < len - 1) {
+                result += chr + address.charAt(++i);
+                lastChar = address.charAt(i);
+                continue;
+            }
+            if (chr === closer) {
+                closer = '';
+            }
+        }
+        else if (chr === '"') {
+            closer = '"';
+            quoteSeen = true;
+        }
+        else if (chr === ':' && routeEnd < 0 && firstChar === '@' && !quoteSeen) {
+            routeEnd = result.length + 1;
+        }
+        else if (chr === '[') {
+            closer = ']';
+        }
+        else if (chr === '(') {
+            depth = 1;
+            continue;
+        }
+        else if (chr === '<') {
+            // Apple Mail drops everything between an unexpected '<' and the address after it.
+            // Read here rather than off the raw brackets so that a '<' inside a quoted string,
+            // a comment or a domain literal stays where it is: '<"a<b"@victim.com>' cut at
+            // the first '<' left the address 'b"@victim.com'
+            result = '';
+            lastChar = '';
+            comments.length = 0;
+            firstChar = '';
+            quoteSeen = false;
+            routeEnd = -1;
+            continue;
+        }
+        result += chr;
+        lastChar = chr;
+        if (!firstChar && !_isSpaceCode(address.charCodeAt(i))) {
+            firstChar = chr;
+        }
+    }
+    if (routeEnd >= 0 && result.indexOf('@', routeEnd) >= 0) {
+        result = result.slice(routeEnd);
+    }
+    if (depth) {
+        // an unterminated comment runs to the end of the address
+        comments.push(comment.trim());
+    }
+    return { address: result.trim(), comments: comments.filter(text => text) };
+}
+/**
+ * Walks the tokens of one entry of an address list and sorts them into the runs of display
+ * text, angle-addr and comment they belong to
+ *
+ * @param tokens Tokens of the whole address list
+ * @param from Index of the first token of the entry
+ * @param to Index just past the last token of the entry
+ * @return The collected runs, and whether the display text came out of a comment
+ */
+function _collectAddressParts(tokens, from, to) {
     let state = 'text';
-    const addresses = [];
     const data = {
         address: [],
         comment: [],
-        group: [],
         text: [],
-        textWasQuoted: []
+        textWasQuoted: [],
+        quotedLocalAt: []
     };
     let insideQuotes = false;
+    // whether the last text run holds nothing but quoted text so far, which is what a quoted
+    // local part is until the '@' after it joins the run
+    let lastTextPureQuoted = false;
     // Last character of the run each state is currently accumulating. Reading it back off
     // the accumulator with slice(-1) makes the engine flatten the whole growing string on
     // every token, which is quadratic over an address built from many comment-joined atoms
     // (GHSA-prgh-xp8r-p3m5). A run only ever grows by the token appended below, so the
     // character is carried along instead of re-read.
-    const lastChars = { address: '', comment: '', group: '', text: '' };
+    const lastChars = { address: '', comment: '', text: '' };
     // Filter out <addresses>, (comments) and regular text
-    for (let i = 0, len = tokens.length; i < len; i++) {
-        const token = tokens[i];
-        const prevToken = i ? tokens[i - 1] : null;
-        if (token.type === 'operator') {
-            switch (token.value) {
+    for (let i = from; i < to; i++) {
+        const value = tokens.value(i);
+        // the operator in front of this token, if there is one, and whether it runs on into it
+        const prevOperator = i > from ? tokens.operatorAt(i - 1) : '';
+        const prevNoBreak = i > from && tokens.noBreak(i - 1);
+        if (tokens.isOperator(i)) {
+            switch (value) {
                 case '<':
                     state = 'address';
                     insideQuotes = false;
                     break;
                 case '(':
                     state = 'comment';
-                    insideQuotes = false;
-                    break;
-                case ':':
-                    state = 'group';
-                    isGroup = true;
                     insideQuotes = false;
                     break;
                 case '"':
@@ -44138,7 +44959,7 @@ function _handleAddress(tokens, depth) {
                     break;
             }
         }
-        else if (token.value) {
+        else {
             // An empty quoted string is dropped by the tokenizer, leaving no text token of its
             // own for textWasQuoted to be recorded on, so the pair of quote operators right in
             // front of this token is all that is left of it and the run it opens carries the
@@ -44146,153 +44967,198 @@ function _handleAddress(tokens, depth) {
             // the quotes never go back on, and the value is no longer an addr-spec a trailing
             // comment can be peeled off of. It only ever opens a run: a run that already holds
             // material collected outside the quotes is not a quoted string, whatever follows it
-            const prevPrevToken = i > 1 ? tokens[i - 2] : null;
-            const opensAfterEmptyQuotedString = prevToken?.type === 'operator' &&
-                prevToken.value === '"' &&
-                !!prevToken.noBreak &&
-                prevPrevToken?.type === 'operator' &&
-                prevPrevToken.value === '"';
-            if (state === 'address') {
-                // Handle unquoted name that includes a "<".
-                // Apple Mail truncates everything between an unexpected < and an address.
-                token.value = token.value.replace(/^[^<]*<\s*/, '');
-            }
+            const opensAfterEmptyQuotedString = prevOperator === '"' && prevNoBreak && i > from + 1 && tokens.operatorAt(i - 2) === '"';
             // A comment is folding whitespace. It may sit inside an addr-spec, on either side
             // of the '@', but it cannot join two atoms into one: gluing across it would read
             // 'user@example.com(x)evil.com' as the single domain 'example.comevil.com' and
             // deliver to a domain the sender never named.
             const parts = data[state];
-            const joins = prevToken &&
-                prevToken.noBreak &&
-                parts.length &&
-                (prevToken.value !== ')' || lastChars[state] === '@' || token.value.charAt(0) === '@');
+            const joins = prevNoBreak && parts.length && (prevOperator !== ')' || lastChars[state] === '@' || value.charAt(0) === '@');
             if (joins) {
-                data[state][data[state].length - 1] += token.value;
-                if (token.value) {
-                    lastChars[state] = token.value.charAt(token.value.length - 1);
+                const last = data[state].length - 1;
+                if (state === 'text' && !insideQuotes) {
+                    if (lastTextPureQuoted && value.charAt(0) === '@') {
+                        data.quotedLocalAt[last] = data.text[last].length;
+                    }
+                    lastTextPureQuoted = false;
                 }
+                data[state][last] += value;
+                lastChars[state] = value.charAt(value.length - 1);
                 if (state === 'text' && insideQuotes) {
-                    data.textWasQuoted[data.textWasQuoted.length - 1] = true;
+                    data.textWasQuoted[last] = true;
                 }
             }
             else {
-                data[state].push(token.value);
-                lastChars[state] = token.value.charAt(token.value.length - 1);
+                data[state].push(value);
+                lastChars[state] = value.charAt(value.length - 1);
                 if (state === 'text') {
                     data.textWasQuoted.push(insideQuotes || opensAfterEmptyQuotedString);
+                    // an empty quoted string leaves no text of its own, so the '@' opens the run
+                    data.quotedLocalAt.push(opensAfterEmptyQuotedString && value.charAt(0) === '@' ? 0 : -1);
+                    lastTextPureQuoted = insideQuotes;
                 }
             }
         }
     }
-    // If there is no text but a comment, replace the two
+    // If there is no text but a comment, replace the two. A comment is never part of a
+    // mailbox, so text that came out of one only ever names it: reading an address out of it
+    // made '(a@evil.com)' a recipient where no conformant reading has a mailbox at all
+    let textFromComment = false;
     if (!data.text.length && data.comment.length) {
         data.text = data.comment;
         data.comment = [];
+        textFromComment = true;
     }
-    if (isGroup) {
-        // http://tools.ietf.org/html/rfc2822#appendix-A.1.3
-        data.text = data.text.join(' ');
-        // Parse group members, but flatten any nested groups (RFC 5322 doesn't allow nesting)
-        let groupMembers = [];
-        if (data.group.length) {
-            const parsedGroup = addressparser(data.group.join(','), { _depth: depth + 1 });
-            parsedGroup.forEach(member => {
-                if (member.group) {
-                    groupMembers = groupMembers.concat(member.group);
-                }
-                else {
-                    groupMembers.push(member);
-                }
-            });
+    return { data, textFromComment };
+}
+/**
+ * Name of a group, from the tokens in front of its ':'. A comment names it when no text does,
+ * as it names a mailbox.
+ *
+ * @param tokens Tokens of the whole address list
+ * @param from Index of the first token in front of the ':'
+ * @param to Index of the ':'
+ * @return Name of the group
+ */
+function _groupName(tokens, from, to) {
+    // http://tools.ietf.org/html/rfc2822#appendix-A.1.3
+    return _collectAddressParts(tokens, from, to).data.text.join(' ');
+}
+/**
+ * Converts tokens for a single address into an address object
+ *
+ * @param tokens Tokens of the whole address list
+ * @param from Index of the first token of this address
+ * @param to Index just past the last token of this address
+ * @return Address object
+ */
+function _handleAddress(tokens, from, to) {
+    const collected = _collectAddressParts(tokens, from, to);
+    const data = collected.data;
+    let textFromComment = collected.textFromComment;
+    // Comments come out of the angle-addr before anything asks whether one was found, so
+    // that brackets holding nothing but a comment read the same as empty ones
+    const addressComments = [];
+    const addressParts = [];
+    for (const part of data.address) {
+        const stripped = _stripAddressComments(part);
+        for (const comment of stripped.comments) {
+            addressComments.push(comment);
         }
-        addresses.push({
-            name: data.text || '',
-            group: groupMembers
-        });
+        if (stripped.address) {
+            addressParts.push(stripped.address);
+        }
     }
-    else {
-        // If no address was found, try to detect one from regular text
-        if (!data.address.length && data.text.length) {
-            for (let i = data.text.length - 1; i >= 0; i--) {
-                // Security: Do not extract email addresses from quoted strings.
-                // RFC 5321 allows @ inside quoted local-parts like "user@domain"@example.com.
-                // Extracting emails from quoted text leads to misrouting vulnerabilities.
-                if (!data.textWasQuoted[i] && ADDR_SPEC.test(data.text[i])) {
-                    data.address = data.text.splice(i, 1);
-                    data.textWasQuoted.splice(i, 1);
-                    break;
-                }
+    data.address = addressParts;
+    // If no address was found, try to detect one from regular text
+    if (!data.address.length && data.text.length && !textFromComment) {
+        // Whitespace beside the '@' is CFWS, so 'user @ good.com' is read as one run. Both
+        // tiers read the collapsed runs, and only a run an address comes out of is replaced
+        // by its collapsed form, the display text keeps its spacing
+        const candidates = data.text.map((part) => _collapseAtSpacing(part));
+        // The first addr-spec in the text is the mailbox, as it is for a conformant parser
+        // reading as far as it can. Taking the last one let a comment part two of them and
+        // pick the second, 'user@good.com (x) evil@evil.com' went to evil.com, while the
+        // same two without the comment, one run, went to good.com
+        for (let i = 0; i < data.text.length; i++) {
+            // Security: Do not extract email addresses from quoted strings.
+            // RFC 5321 allows @ inside quoted local-parts like "user@domain"@example.com.
+            // Extracting emails from quoted text leads to misrouting vulnerabilities.
+            // A run that is a quoted local part with its '@' and domain is an addr-spec of
+            // its own, with the quoting put back on, and takes its turn like any other
+            const local = data.quotedLocalAt[i];
+            const quotedLocal = data.textWasQuoted[i] && local >= 0 && QUOTED_LOCAL_DOMAIN.test(data.text[i].slice(local)) ? _quoteLocalPart(data.text[i]) : '';
+            if (quotedLocal || (!data.textWasQuoted[i] && _isAddrSpec(candidates[i]))) {
+                data.address = [quotedLocal || candidates[i]];
+                data.text.splice(i, 1);
+                data.textWasQuoted.splice(i, 1);
+                data.quotedLocalAt.splice(i, 1);
+                break;
             }
-            // Try a looser regex match if strict match found nothing
-            if (!data.address.length) {
-                let extracted = false;
-                for (let i = data.text.length - 1; i >= 0; i--) {
-                    // Security: Do not extract email addresses from quoted strings
-                    if (!data.textWasQuoted[i]) {
-                        const part = data.text[i];
-                        let remainder = part;
-                        const at = _looseAddressStart(part);
-                        if (at >= 0) {
-                            LOOSE_TEXT_ADDR.lastIndex = at;
-                            const match = LOOSE_TEXT_ADDR.exec(part);
-                            if (match) {
-                                data.address = [match[0].trim()];
-                                extracted = true;
-                                remainder = part.slice(0, at) + ' ' + part.slice(at + match[0].length);
-                            }
+        }
+        // Try a looser regex match if strict match found nothing
+        if (!data.address.length) {
+            let extracted = false;
+            for (let i = 0; i < data.text.length; i++) {
+                // Security: Do not extract email addresses from quoted strings
+                if (!data.textWasQuoted[i]) {
+                    // the strict tier found nothing, so it spliced nothing and the indexes still line up
+                    const part = candidates[i];
+                    let remainder = data.text[i];
+                    const at = _looseAddressStart(part);
+                    if (at >= 0) {
+                        LOOSE_TEXT_ADDR.lastIndex = at;
+                        const match = LOOSE_TEXT_ADDR.exec(part);
+                        if (match) {
+                            data.address = [match[0].trim()];
+                            extracted = true;
+                            remainder = part.slice(0, at) + ' ' + part.slice(at + match[0].length);
                         }
-                        data.text[i] = remainder.trim();
-                        if (extracted) {
-                            break;
-                        }
+                    }
+                    data.text[i] = remainder.trim();
+                    if (extracted) {
+                        break;
                     }
                 }
             }
         }
-        // If there's still no text but a comment exists, replace the two
-        if (!data.text.length && data.comment.length) {
-            data.text = data.comment;
-            data.comment = [];
-        }
-        // Keep only the first address occurrence, push others to regular text
-        if (data.address.length > 1) {
-            data.text = data.text.concat(data.address.splice(1));
-        }
-        // An address is only taken from unquoted text, so anything left in the text at this
-        // point that still has to serve as the address carries its quoting in this flag
-        const addressFromQuotedText = !data.address.length && data.textWasQuoted.some(wasQuoted => wasQuoted);
-        // Join values with spaces
-        data.text = data.text.join(' ');
-        data.address = data.address.join(' ');
-        if (addressFromQuotedText && data.text) {
-            // The mailbox is still sitting in the text, so it moves over here and is quoted
-            // before the recovery below rather than after it. Anything else the text holds
-            // came along with it: a comment ends the domain but leaves the atoms behind it in
-            // the same text, and '"user"@example.com(x)evil.com' was handed on as the address
-            // 'user@example.com evil.com', a second domain riding into the envelope recipient
-            // on a value that is no addr-spec at all (GHSA-g57g-f23g-4646). Putting the quotes
-            // back first is what lets the recovery tell the whitespace an addr-spec may carry
-            // from the wreckage trailing one, as only a quoted local part may hold whitespace
-            data.address = _quoteLocalPart(data.text);
-            data.text = '';
-        }
-        _recoverAddrSpec(data);
-        const address = {
-            address: data.address || data.text || '',
-            name: data.text || data.address || ''
-        };
-        if (address.address === address.name) {
-            if (/@/.test(address.address || '')) {
-                address.name = '';
-            }
-            else {
-                address.address = '';
-            }
-        }
-        addresses.push(address);
     }
-    return addresses;
+    // If there's still no text but a comment exists, replace the two
+    if (!data.text.length && data.comment.length) {
+        data.text = data.comment;
+        data.comment = [];
+    }
+    // Keep only the first address occurrence, push others to regular text
+    if (data.address.length > 1) {
+        data.text = data.text.concat(data.address.splice(1));
+    }
+    // An address is only taken from unquoted text, so anything left in the text at this
+    // point that still has to serve as the address carries its quoting in this flag
+    const addressFromQuotedText = !data.address.length && data.textWasQuoted.some(wasQuoted => wasQuoted);
+    // Join values with spaces
+    data.text = data.text.join(' ');
+    data.address = data.address.join(' ');
+    if (addressFromQuotedText && data.text.indexOf('@') >= 0) {
+        // A quoted run with no '@' in it is a display name and nothing else, so it stays
+        // where it is. Moving it over anyway made a comment the mailbox was read from:
+        // '"Display Name" <(a comment)>' handed on 'Display Name' as the address with the
+        // comment as the name, and a quoted name holding a ',' or a ';' became an address
+        // that reads as two recipients once a consumer writes it back into a header.
+        //
+        // The mailbox is still sitting in the text, so it moves over here and is quoted
+        // before the recovery below rather than after it. Anything else the text holds
+        // came along with it: a comment ends the domain but leaves the atoms behind it in
+        // the same text, and '"user"@example.com(x)evil.com' was handed on as the address
+        // 'user@example.com evil.com', a second domain riding into the envelope recipient
+        // on a value that is no addr-spec at all (GHSA-g57g-f23g-4646). Putting the quotes
+        // back first is what lets the recovery tell the whitespace an addr-spec may carry
+        // from the wreckage trailing one, as only a quoted local part may hold whitespace
+        // The quotes are gone at this point, so the '@' the domain splits off at is the
+        // last one, not the single one _collapseAtSpacing insists on
+        data.address = _quoteLocalPart(_joinAtSpacing(data.text, _domainAt(data.text)));
+        data.text = '';
+    }
+    _recoverAddrSpec(data);
+    // a comment names the mailbox only when nothing else does, as one outside the brackets
+    if (!data.text && addressComments.length) {
+        data.text = addressComments.join(' ');
+        textFromComment = true;
+    }
+    const address = {
+        address: data.address || (textFromComment ? '' : data.text) || '',
+        name: data.text || data.address || ''
+    };
+    if (address.address === address.name) {
+        if (/@/.test(address.address || '')) {
+            address.name = '';
+        }
+        else {
+            address.address = '';
+        }
+    }
+    return address;
 }
+/* eslint-disable no-bitwise -- see TokenList */
 /**
  * Creates a Tokenizer object for tokenizing address field strings
  *
@@ -44304,10 +45170,16 @@ class Tokenizer {
         this.str = (str || '').toString();
         this.operatorCurrent = '';
         this.operatorExpecting = '';
-        this.node = null;
+        this.node = -1;
         this.escaped = false;
         this.inDomainLiteral = false;
-        this.list = [];
+        this.afterAt = false;
+        this.inGroup = false;
+        this.innerQuoted = false;
+        this.innerComment = 0;
+        this.innerLiteral = false;
+        this.innerEscaped = false;
+        this.list = new TokenList(this.str);
         /**
          * Operator tokens and which tokens are expected to end the sequence
          */
@@ -44316,7 +45188,9 @@ class Tokenizer {
             '(': ')',
             '<': '>',
             ',': '',
-            ':': ';',
+            // A group is read in the same pass as the rest of the list, so its ':' only marks
+            // where the name ends and its members are tokenized like any other address
+            ':': '',
             // Semicolons are not a legal delimiter per the RFC2822 grammar other
             // than for terminating a group, but they are also not valid for any
             // other use in this context.  Given that some mail clients have
@@ -44332,168 +45206,374 @@ class Tokenizer {
      * @return An array of operator|text tokens
      */
     tokenize() {
-        const list = [];
-        for (let i = 0, len = this.str.length; i < len; i++) {
-            const chr = this.str.charAt(i);
-            const nextChr = i < len - 1 ? this.str.charAt(i + 1) : null;
-            this.checkChar(chr, nextChr);
+        const str = this.str;
+        const len = str.length;
+        for (let i = 0; i < len; i++) {
+            this.checkChar(str.charAt(i), i);
         }
-        this.list.forEach(node => {
-            node.value = (node.value || '').toString().trim();
-            if (node.value) {
-                list.push(node);
+        this._closeText(len);
+        // Compacted in place: a text run is trimmed to its value and one left empty is
+        // dropped, and the value of a run that is no plain slice is rebuilt and kept aside
+        const list = this.list;
+        const slots = list.slots;
+        let kept = 0;
+        for (let i = 0, count = list.length; i < count; i++) {
+            const kind = slots[i * 3];
+            let start = slots[i * 3 + 1];
+            let end = slots[i * 3 + 2];
+            if (kind & TOKEN_DIRTY) {
+                const value = this._cleanValue(start, end, kind).trim();
+                if (!value) {
+                    continue;
+                }
+                list.cleaned.set(kept, value);
             }
-        });
+            else if (!(kind & TOKEN_OPERATOR)) {
+                while (start < end && _isSpaceCode(str.charCodeAt(start))) {
+                    start++;
+                }
+                while (end > start && _isSpaceCode(str.charCodeAt(end - 1))) {
+                    end--;
+                }
+                if (start === end) {
+                    continue;
+                }
+            }
+            slots[kept * 3] = kind;
+            slots[kept * 3 + 1] = start;
+            slots[kept * 3 + 2] = end;
+            kept++;
+        }
+        list.length = kept;
         return list;
+    }
+    /**
+     * Ends the text run being collected, if there is one
+     *
+     * @param end Offset just past its last character
+     */
+    _closeText(end) {
+        if (this.node >= 0) {
+            this.list.slots[this.node * 3 + 2] = end;
+            this.node = -1;
+        }
+    }
+    /**
+     * Rebuilds the value of a text run that is no plain slice of the field, applying the
+     * rules checkChar collects characters by: an escaping backslash is dropped, a line break
+     * reads as a space and any other control character is left out
+     *
+     * @param start Offset of the first character of the run
+     * @param end Offset just past its last character
+     * @param kind Kind and flags of the run
+     * @return Value of the run
+     */
+    _cleanValue(start, end, kind) {
+        const str = this.str;
+        const escapes = (kind & TOKEN_ESCAPES) !== 0;
+        let escaped = (kind & TOKEN_STARTS_ESCAPED) !== 0;
+        let value = '';
+        for (let i = start; i < end; i++) {
+            const chr = str.charAt(i);
+            if (escapes && !escaped && chr === '\\') {
+                escaped = true;
+                continue;
+            }
+            escaped = false;
+            if (chr === '\n') {
+                value += ' ';
+            }
+            else if (chr.charCodeAt(0) >= 0x21 || chr === ' ' || chr === '\t') {
+                value += chr;
+            }
+        }
+        return value;
     }
     /**
      * Checks if a character is an operator or text and acts accordingly
      *
      * @param chr Character from the address field
+     * @param i Offset of the character in the field
      */
-    checkChar(chr, nextChr) {
-        // Track RFC 5322 domain-literals ("[" *dtext "]"). Operator characters such
-        // as the ":" of an IPv6 address-literal (user@[IPv6:2001:db8::1]) are dtext
-        // and must not be treated as the group delimiter while inside the brackets.
-        // Quoted strings and comments are handled separately via operatorExpecting,
-        // so only enter this state when no operator is open. The list separators ","
-        // and ";" are the exception: they always end the literal (and split the
-        // address list) so that an unclosed "[" cannot swallow later recipients.
+    checkChar(chr, i) {
+        // Track RFC 5322 domain-literals ("[" *dtext "]"). The ":" of an IPv6
+        // address-literal (user@[IPv6:2001:db8::1]) is dtext and must not be treated as
+        // the group delimiter while inside the brackets. That is the only operator the
+        // literal hides: letting it hide the others as well meant a "[" could turn the
+        // comment, quoted string or angle-addr after it into text and pick a different
+        // mailbox, '[ ( ] <a@victim.com> ) <b@evil.com>' yielded a@victim.com where
+        // RFC 5322 reads b@evil.com. A "[" also only opens a literal right after the "@"
+        // of an addr-spec, so the group delimiter of a display name holding one stays
+        // intact. Quoted strings and comments are handled separately via
+        // operatorExpecting, so only enter this state when no operator is open. The list
+        // separators "," and ";" always end the literal (and split the address list) so
+        // that an unclosed "[" cannot swallow later recipients.
         if (!this.escaped && !this.operatorExpecting) {
-            if (!this.inDomainLiteral && chr === '[') {
+            if (!this.inDomainLiteral && chr === '[' && this.afterAt) {
                 this.inDomainLiteral = true;
             }
             else if (this.inDomainLiteral && (chr === ']' || chr === ',' || chr === ';')) {
                 this.inDomainLiteral = false;
             }
         }
+        // The closer of an angle-addr is only read outside the quoted strings, comments and
+        // domain literals it holds. Looking for nothing but the closer let a '>' inside a
+        // quoted local part end the angle-addr, '<"a@evil.com>"@good.com>' was read as an
+        // address at evil.com. The characters are still collected as they are, the angle-addr
+        // is read again later
+        let nested = false;
+        if (this.operatorExpecting === '>') {
+            nested = this._trackInner(chr);
+            if (!nested && chr === ';' && this.inGroup) {
+                // The ';' of a group ends an angle-addr left open inside it, as it always did
+                // when a group was cut out of the field at its ';' and parsed on its own. Read
+                // as text instead, an unclosed '<' swallowed the end of the group and every
+                // recipient after it
+                this._closeText(i);
+                this.operatorExpecting = '';
+                this._resetInner();
+            }
+        }
+        else if (this.operatorExpecting === ')' && !this.escaped) {
+            // Comments nest (RFC 5322 3.2.2). Ending one at the first ')' let the ')' of a
+            // nested comment close the outer one and released the rest of it, an address
+            // included, into the header
+            if (chr === '(') {
+                this.innerComment++;
+            }
+            else if (chr === ')' && this.innerComment) {
+                this.innerComment--;
+                nested = true;
+            }
+        }
         if (this.escaped) {
             // ignore next condition blocks
         }
-        else if (chr === this.operatorExpecting) {
-            this.node = {
-                type: 'operator',
-                value: chr
-            };
-            if (nextChr && ![' ', '\t', '\r', '\n', ',', ';'].includes(nextChr)) {
-                this.node.noBreak = true;
+        else if (chr === this.operatorExpecting && !nested) {
+            const nextChr = this.str.charAt(i + 1);
+            this._closeText(i);
+            this.list.push(nextChr && ![' ', '\t', '\r', '\n', ',', ';'].includes(nextChr) ? TOKEN_OPERATOR | TOKEN_NO_BREAK : TOKEN_OPERATOR, i, i + 1);
+            if (chr !== ')') {
+                // a comment is folding whitespace, it does not part the "@" from the "["
+                this.afterAt = false;
             }
-            this.list.push(this.node);
-            this.node = null;
             this.operatorExpecting = '';
             this.escaped = false;
+            this._resetInner();
             return;
         }
-        else if (!this.operatorExpecting && !this.inDomainLiteral && chr in this.operators) {
-            this.node = {
-                type: 'operator',
-                value: chr
-            };
-            this.list.push(this.node);
-            this.node = null;
+        else if (!this.operatorExpecting && !(this.inDomainLiteral && chr === ':') && chr in this.operators) {
+            this._closeText(i);
+            this.list.push(TOKEN_OPERATOR, i, i + 1);
+            if (chr === ':') {
+                this.inGroup = true;
+            }
+            else if (chr === ';') {
+                this.inGroup = false;
+            }
+            if (chr !== '(') {
+                this.afterAt = false;
+            }
             this.operatorExpecting = this.operators[chr];
             this.escaped = false;
+            this._resetInner();
             return;
         }
-        else if (['"', "'"].includes(this.operatorExpecting) && chr === '\\') {
+        else if (['"', "'", ')'].includes(this.operatorExpecting) && chr === '\\') {
+            // A backslash escapes the next character inside a quoted string and inside a
+            // comment alike (RFC 5322 3.2.2, ccontent includes quoted-pair). Honouring it
+            // only in quoted strings let an escaped parenthesis close the comment, which
+            // released the rest of it, an address included, into the header
             this.escaped = true;
+            if (this.node >= 0) {
+                // the backslash is left out of the value
+                this.list.slots[this.node * 3] |= TOKEN_DIRTY;
+            }
             return;
         }
-        if (!this.node) {
-            this.node = {
-                type: 'text',
-                value: ''
-            };
-            this.list.push(this.node);
+        if (this.node < 0) {
+            this.node = this.list.push((this.operatorExpecting === '"' || this.operatorExpecting === ')' ? TOKEN_ESCAPES : 0) | (this.escaped ? TOKEN_STARTS_ESCAPED : 0), i, i);
         }
         if (chr === '\n') {
             // Convert newlines to spaces. Carriage return is ignored as \r and \n usually
             // go together anyway and there already is a WS for \n. Lone \r means something is fishy.
             chr = ' ';
+            this.list.slots[this.node * 3] |= TOKEN_DIRTY;
         }
-        if (chr.charCodeAt(0) >= 0x21 || [' ', '\t'].includes(chr)) {
+        if (chr.charCodeAt(0) >= 0x21 || chr === ' ' || chr === '\t') {
+            // the character is part of the value, which is read off the field later
+            // text inside a quoted string or a comment is not part of an addr-spec. Tracked
+            // as it goes rather than read back off the value (see lastChars in _handleAddress)
+            if (!this.operatorExpecting && chr !== ' ' && chr !== '\t') {
+                this.afterAt = chr === '@';
+            }
+        }
+        else {
             // skip command bytes
-            this.node.value += chr;
+            this.list.slots[this.node * 3] |= TOKEN_DIRTY;
         }
         this.escaped = false;
     }
-}
-/**
- * Maximum recursion depth for parsing nested groups.
- * RFC 5322 doesn't allow nested groups, so this is a safeguard against
- * malicious input that could cause stack overflow.
- */
-const MAX_NESTED_GROUP_DEPTH = 50;
-/**
- * Parses structured e-mail addresses from an address field
- *
- * Example:
- *
- *    'Name <address@domain>'
- *
- * will be converted to
- *
- *     [{name: 'Name', address: 'address@domain'}]
- *
- * @param str Address field
- * @param options Optional options object
- * @param options._depth Internal recursion depth counter (do not set manually)
- * @return An array of address objects
- */
-function addressparser(str, options) {
-    options = options || {};
-    const depth = options._depth || 0;
-    // Prevent stack overflow from deeply nested groups (DoS protection)
-    if (depth > MAX_NESTED_GROUP_DEPTH) {
-        return [];
-    }
-    const tokenizer = new Tokenizer(str);
-    const tokens = tokenizer.tokenize();
-    const addresses = [];
-    let address = [];
-    let parsedAddresses = [];
-    tokens.forEach(token => {
-        if (token.type === 'operator' && (token.value === ',' || token.value === ';')) {
-            if (address.length) {
-                addresses.push(address);
+    /**
+     * Tracks the quoted strings, comments and domain literals inside an angle-addr, which its
+     * closer must not be read from. A backslash escapes the next character inside a quoted
+     * string and a comment. A domain literal opens right after an "@" and ends at the "]".
+     * dtext holds the list separators as well, and inside the brackets they never split the
+     * list anyway.
+     *
+     * @param chr Character from the address field
+     * @return true while the character sits inside one of them, the one that closes it included
+     */
+    _trackInner(chr) {
+        if (this.innerEscaped) {
+            this.innerEscaped = false;
+            return true;
+        }
+        if (this.innerQuoted) {
+            if (chr === '\\') {
+                this.innerEscaped = true;
             }
-            address = [];
+            else if (chr === '"') {
+                this.innerQuoted = false;
+            }
+            return true;
         }
-        else {
-            address.push(token);
+        if (this.innerComment) {
+            if (chr === '\\') {
+                this.innerEscaped = true;
+            }
+            else if (chr === '(') {
+                this.innerComment++;
+            }
+            else if (chr === ')') {
+                this.innerComment--;
+            }
+            return true;
         }
-    });
-    if (address.length) {
-        addresses.push(address);
+        if (this.innerLiteral) {
+            if (chr === ']') {
+                this.innerLiteral = false;
+            }
+            return true;
+        }
+        if (chr === '"') {
+            this.innerQuoted = true;
+            return true;
+        }
+        if (chr === '(') {
+            this.innerComment = 1;
+            return true;
+        }
+        if (chr === '[' && this.afterAt) {
+            this.innerLiteral = true;
+            return true;
+        }
+        // afterAt is otherwise only kept outside the operators and is cleared when one opens
+        // or ends, so inside an angle-addr it serves the literal tracked here
+        if (!_isSpaceCode(chr.charCodeAt(0))) {
+            this.afterAt = chr === '@';
+        }
+        return false;
     }
-    addresses.forEach(addr => {
-        const handled = _handleAddress(addr, depth);
-        // Appended in place. Rebuilding the accumulator with concat() would copy every
-        // entry collected so far on each address, making a flat list cost O(n^2).
-        for (let i = 0; i < handled.length; i++) {
-            parsedAddresses.push(handled[i]);
-        }
-    });
-    // Merge fragments produced when unquoted display names contain commas.
-    // "Joe Foo, PhD <joe@example.com>" is split on the comma into
-    // [{name:"Joe Foo", address:""}, {name:"PhD", address:"joe@example.com"}].
-    // Recombine: a name-only entry followed by an entry with both name and address.
-    // Walked back to front so that a run of fragments folds into one entry in a single
-    // pass. Splicing each fragment out of the list instead would cost O(n^2).
-    const mergedAddresses = [];
-    for (let i = parsedAddresses.length - 1; i >= 0; i--) {
-        const current = parsedAddresses[i];
-        const next = mergedAddresses.length ? mergedAddresses[mergedAddresses.length - 1] : null;
+    /**
+     * Forgets the nesting collected for the operator that just opened or ended
+     */
+    _resetInner() {
+        this.innerQuoted = false;
+        this.innerComment = 0;
+        this.innerLiteral = false;
+        this.innerEscaped = false;
+    }
+}
+/* eslint-enable no-bitwise */
+/**
+ * Folds the fragments an unquoted display name holding a comma is split into back together.
+ *
+ * "Joe Foo, PhD <joe@example.com>" is split on the comma into
+ * [{name:"Joe Foo", address:""}, {name:"PhD", address:"joe@example.com"}]. A name-only entry
+ * followed by an entry with both name and address is recombined. Walked back to front so
+ * that a run of fragments folds into one entry in a single pass. Splicing each fragment out
+ * of the list instead would cost O(n^2).
+ *
+ * @param list Parsed entries, in order
+ * @return The entries with the fragments folded in
+ */
+function _mergeNameFragments(list) {
+    const merged = [];
+    for (let i = list.length - 1; i >= 0; i--) {
+        const current = list[i];
+        const next = merged.length ? merged[merged.length - 1] : null;
         if (next && current.address === '' && current.name && !current.group && next.address && next.name) {
             next.name = current.name + ', ' + next.name;
         }
         else {
-            mergedAddresses.push(current);
+            merged.push(current);
         }
     }
-    mergedAddresses.reverse();
-    parsedAddresses = mergedAddresses;
-    if (options.flatten) {
+    return merged.reverse();
+}
+/**
+ * Parses an address list, groups included, in a single pass over its tokens.
+ *
+ * A group used to be cut out of the field at the ';' that ends it and parsed again as an
+ * address list of its own, recursively, so every level of nesting parsed what was left of
+ * the field once more and the depth had to be capped. RFC 5322 does not nest groups at all,
+ * and the nested ones were flattened anyway. The tokens are now walked once: a ':' opens a
+ * group, its members are read as they come, a ';' closes it. A ':' inside an open group
+ * stands for a group nested in it, whose name is dropped and whose members belong to the
+ * outer one, which is how they were flattened before. The first ';' ends the group, nested
+ * or not, as it did.
+ *
+ * @param str Address field
+ * @return An array of address objects
+ */
+function _parseAddressList(str) {
+    const tokens = new Tokenizer(str).tokenize();
+    const parsedAddresses = [];
+    let group = null;
+    let members = [];
+    // Every address is handed over as the range of the token list it covers, as soon as the
+    // separator after it is seen. Copying the tokens of each address into an array of its own,
+    // and collecting those before handling any, held a second structure as large as the token
+    // list for the whole parse, and an array that receives a single push is allocated room for
+    // seventeen: a list of one letter names took some 80 times its size in that alone
+    let from = 0;
+    for (let i = 0, len = tokens.length; i <= len; i++) {
+        const operator = i < len ? tokens.operatorAt(i) : '';
+        if (i < len && operator !== ',' && operator !== ';' && operator !== ':') {
+            continue;
+        }
+        if (operator === ':') {
+            if (!group) {
+                group = { name: _groupName(tokens, from, i), group: [] };
+                members = [];
+            }
+            from = i + 1;
+            continue;
+        }
+        if (i > from) {
+            // Appended in place. Rebuilding the accumulator with concat() would copy every
+            // entry collected so far on each address, making a flat list cost O(n^2).
+            const address = _handleAddress(tokens, from, i);
+            if (group) {
+                members.push(address);
+            }
+            else {
+                parsedAddresses.push(address);
+            }
+        }
+        from = i + 1;
+        if (group && (operator === ';' || i === len)) {
+            group.group = _mergeNameFragments(members);
+            parsedAddresses.push(group);
+            group = null;
+        }
+    }
+    return _mergeNameFragments(parsedAddresses);
+}
+function addressparser(str, options) {
+    const parsedAddresses = _parseAddressList(str);
+    if (options?.flatten) {
         const flatAddresses = [];
         const walkAddressList = (list) => {
             list.forEach(entry => {
@@ -44508,6 +45588,7 @@ function addressparser(str, options) {
     }
     return parsedAddresses;
 }
+/* harmony default export */ const esm_addressparser = (addressparser);
 
 ;// CONCATENATED MODULE: ./node_modules/nodemailer/dist/esm/mime-node/last-newline.js
 
@@ -44648,6 +45729,35 @@ const QUOTED_STRING = /^"(?:[^"\\]|\\[\s\S])*"$/;
 // else goes into angle brackets so that the header can not be read as more addresses than
 // the envelope carries
 const PLAIN_ADDRESS = /^[^\s"(),:;<>@[\\\]]+@[^\s"(),:;<>@[\\\]]+$/;
+/**
+ * A domain literal that ends an address, see _normalizeAddress
+ */
+const mime_node_DOMAIN_LITERAL_TAIL = /@(\[[^[\]\\]*\])$/;
+/**
+ * Removes the whitespace inside every <...> of a References value. A "<" with no ">" after
+ * it is left as it is. An index scan, the regex /<[^>]*>/g rescans the rest of the value
+ * from every such "<"
+ *
+ * @param value References header value
+ * @returns The value with the msg-ids closed up
+ */
+function stripWhitespaceInAngleBrackets(value) {
+    let result = '';
+    let pos = 0;
+    for (;;) {
+        const open = value.indexOf('<', pos);
+        if (open < 0) {
+            break;
+        }
+        const close = value.indexOf('>', open + 1);
+        if (close < 0) {
+            break;
+        }
+        result += value.slice(pos, open) + value.slice(open, close + 1).replace(/\s/g, '');
+        pos = close + 1;
+    }
+    return result + value.slice(pos);
+}
 // domainToASCII and domainToUnicode are WHATWG host parsers rather than plain IDNA
 // mappers, so they do more than map: they cut the host at '/', '\\', '?' and '#', drop C0
 // controls, and percent-decode. Handing them 'evil.example/mail.corp.example' returns the
@@ -44655,6 +45765,42 @@ const PLAIN_ADDRESS = /^[^\s"(),:;<>@[\\\]]+@[^\s"(),:;<>@[\\\]]+$/;
 // unroutable garbage into mail for a domain the sender never named. None of these
 // characters are legal in a domain, so keep them away from the mapper.
 const URL_PARSER_UNSAFE = /[/\\?#%\x00-\x20\x7F]/;
+// RFC 1035 bounds a label at 63 octets and a domain at 253. An A-label is never shorter than
+// the code points it encodes, so anything past these bounds could not have become a valid
+// domain whichever way it is encoded. The bundled codec is super-linear in the length of a
+// label, a 60 KB label of distinct code points took seconds to encode, several times per
+// address, so it is only handed what could be a domain
+const MAX_DOMAIN_LENGTH = 253;
+const MAX_LABEL_LENGTH = 63;
+// pipeline() needs a callback to not throw, the errors it sees reach the last stream anyway
+const PIPELINE_NOOP = () => false;
+// The error a node streaming into an output that was destroyed stops with
+function abortedError() {
+    const err = new Error('Message stream was closed before the message was generated');
+    err.code = ESTREAM;
+    return err;
+}
+/**
+ * Checks a domain against the DNS length limits, counted in code points per label and in
+ * total. The label separators are the ones the bundled codec splits on.
+ *
+ * @param domain Domain to check
+ * @return true if a label or the domain as a whole is too long to be a valid domain
+ */
+function exceedsDomainLimits(domain) {
+    let total = 0;
+    let label = 0;
+    for (const char of domain) {
+        total++;
+        if (char === '.' || char === '。' || char === '．' || char === '｡') {
+            label = 0;
+        }
+        else if (++label > MAX_LABEL_LENGTH) {
+            return true;
+        }
+    }
+    return total > MAX_DOMAIN_LENGTH;
+}
 /**
  * Encodes a domain the way browsers, the WHATWG URL Standard and DNS facing resolvers do,
  * which is with UTS-46 mapping applied before the Punycode step.
@@ -44674,12 +45820,19 @@ const URL_PARSER_UNSAFE = /[/\\?#%\x00-\x20\x7F]/;
  */
 function normalizeDomain(domain, toUnicode) {
     // domainToASCII and domainToUnicode landed in Node 7, the bundled codec covers Node 6
-    const mapper = toUnicode ? external_node_url_.domainToUnicode : external_node_url_.domainToASCII;
-    if (typeof mapper === 'function' && !URL_PARSER_UNSAFE.test(domain)) {
-        const mapped = mapper(domain);
+    if (typeof external_node_url_.domainToASCII === 'function' && typeof external_node_url_.domainToUnicode === 'function' && !URL_PARSER_UNSAFE.test(domain)) {
+        // The U-label form is decoded from the A-label form rather than from the input:
+        // Deno's domainToASCII returns an empty string for a label it cannot decode, while
+        // its domainToUnicode returns the label with U+FFFD in place of the bad part
+        const ascii = external_node_url_.domainToASCII(domain);
+        const mapped = ascii && toUnicode ? external_node_url_.domainToUnicode(ascii) : ascii;
         if (mapped) {
             return mapped;
         }
+    }
+    if (exceedsDomainLimits(domain)) {
+        // too long to be a domain whichever way it is encoded, keep it as supplied
+        return domain;
     }
     return toUnicode ? punycode_toUnicode(domain) : toASCII(domain);
 }
@@ -45028,11 +46181,7 @@ class MimeNode {
         if (typeof this.content.pipe === 'function') {
             // pre-stream handler. might be triggered if a stream is set as content
             // and 'error' fires before anything is done with this stream
-            this._contentErrorHandler = err => {
-                this.content.removeListener('error', this._contentErrorHandler);
-                this.content = err;
-            };
-            this.content.once('error', this._contentErrorHandler);
+            recordStreamErrors(this.content);
         }
         else if (typeof this.content === 'string') {
             this._isPlainText = isPlainText(this.content);
@@ -45170,24 +46319,36 @@ class MimeNode {
                 return;
             }
             switch (header.key) {
+                // The comments of a MIME header are not part of its value and are dropped, so a
+                // caller supplied 'boundary=b (comment)' is the boundary b it names, and the
+                // header goes out without the comment
                 case 'Content-Disposition':
-                    structured = parseHeaderValue(value);
+                    structured = parseHeaderValue(value, { stripComments: true });
                     if (this.filename) {
                         structured.params.filename = this.filename;
                     }
                     value = buildHeaderValue(structured);
                     break;
                 case 'Content-Type':
-                    structured = parseHeaderValue(value);
+                    structured = parseHeaderValue(value, { stripComments: true });
                     // the type token decides multipart and charset below, so clean it before
                     // those run and not just on the way out, otherwise a control char makes
                     // the checks miss and the header ends up claiming a type it is not set up for
                     structured.value = (structured.value || '').toString().replace(/[\x00-\x1f\x7f]/g, '');
                     this._handleContentType(structured);
-                    if (structured.value.match(/^text\/plain\b/) &&
-                        typeof this.content === 'string' &&
-                        /[\u0080-\uFFFF]/.test(this.content)) {
+                    if (structured.value.match(/^text\/plain\b/) && typeof this.content === 'string' && /[\u0080-\uFFFF]/.test(this.content)) {
                         structured.params.charset = 'utf-8';
+                    }
+                    if (this.filename) {
+                        // the name parameter is derived from the filename below, so a name that
+                        // arrived inside the content type is dropped first (a plain parameter or
+                        // rfc2231 continuation sections), otherwise the header carries two and a
+                        // receiver that reads the first sees a name the filename does not match
+                        for (const paramKey of Object.keys(structured.params)) {
+                            if (/^name(\*|$)/i.test(paramKey)) {
+                                delete structured.params[paramKey];
+                            }
+                        }
                     }
                     value = buildHeaderValue(structured);
                     if (this.filename) {
@@ -45216,7 +46377,7 @@ class MimeNode {
                     }
                     break;
             }
-            value = this._encodeHeaderValue(key, value);
+            value = this.encodeHeaderValue(key, value);
             // skip empty lines
             if (!(value || '').toString().trim()) {
                 return;
@@ -45244,40 +46405,45 @@ class MimeNode {
     createReadStream(options) {
         options = options || {};
         const stream = new external_node_stream_.PassThrough(options);
-        let outputStream = stream;
-        let transform;
         this.stream(stream, options, err => {
             if (err) {
-                outputStream.emit('error', err);
+                stream.destroy(err);
                 return;
             }
             stream.end();
         });
-        for (let i = 0, len = this._transforms.length; i < len; i++) {
-            transform =
-                typeof this._transforms[i] === 'function' ? this._transforms[i]() : this._transforms[i];
-            outputStream.once('error', err => {
-                transform.emit('error', err);
-            });
-            outputStream = outputStream.pipe(transform);
+        // the content streams of the nodes the message did not get to are not going to be read
+        stream.once('close', () => {
+            if (!stream.writableFinished) {
+                this._destroyContentStreams();
+            }
+        });
+        // The stages are joined with pipeline, which destroys all of them when any one fails
+        // or is destroyed. An error anywhere reaches the returned stream exactly once, and a
+        // consumer that destroys the returned stream stops the tree from reading its sources
+        const stages = [stream];
+        for (const transform of this._transforms) {
+            stages.push(typeof transform === 'function' ? transform() : transform);
         }
         // ensure terminating newline after possible user transforms
-        transform = new LastNewline();
-        outputStream.once('error', err => {
-            transform.emit('error', err);
-        });
-        outputStream = outputStream.pipe(transform);
-        // dkim and stuff
-        for (let i = 0, len = this._processFuncs.length; i < len; i++) {
-            transform = this._processFuncs[i];
-            outputStream = transform(outputStream);
+        stages.push(new LastNewline());
+        let outputStream = (0,external_node_stream_.pipeline)(stages, PIPELINE_NOOP);
+        // dkim and stuff. A process function reads its input itself and reports the errors of
+        // that input on its output, so only a consumer abort has to be carried back upstream
+        for (const processFunc of this._processFuncs) {
+            const input = outputStream;
+            outputStream = processFunc(input);
+            if (outputStream !== input) {
+                (0,external_node_stream_.finished)(outputStream, err => {
+                    if (err) {
+                        input.destroy();
+                    }
+                });
+            }
         }
         if (this.newline) {
             const winbreak = ['win', 'windows', 'dos', '\r\n'].includes(this.newline.toString().toLowerCase());
-            const newlineTransform = winbreak ? new LeWindows() : new LeUnix();
-            const stream = outputStream.pipe(newlineTransform);
-            outputStream.on('error', err => stream.emit('error', err));
-            return stream;
+            outputStream = (0,external_node_stream_.pipeline)(outputStream, winbreak ? new LeWindows() : new LeUnix(), PIPELINE_NOOP);
         }
         return outputStream;
     }
@@ -45303,8 +46469,10 @@ class MimeNode {
     }
     stream(outputStream, options, done) {
         const transferEncoding = this.getTransferEncoding();
-        let contentStream;
-        let localStream;
+        // the streams this node is reading from. A consumer that goes away mid-message destroys
+        // the output, and these are released with it instead of staying paused with a file or a
+        // socket open behind them
+        let activeStreams = [];
         // protect actual callback against multiple triggering
         let returned = false;
         const callback = (err) => {
@@ -45312,13 +46480,39 @@ class MimeNode {
                 return;
             }
             returned = true;
+            outputStream.removeListener('close', onOutputClose);
             done(err);
+        };
+        function onOutputClose() {
+            for (const stream of activeStreams) {
+                stream.destroy();
+            }
+            return callback(abortedError());
+        }
+        // reads the streams into the output. The listener is only attached while the node reads
+        // something, a deeply nested tree would otherwise stack one per level on the output
+        const readInto = (...streams) => {
+            if (!activeStreams.length) {
+                outputStream.once('close', onOutputClose);
+            }
+            activeStreams = streams;
+        };
+        // stops here if the output was destroyed in the meantime
+        const aborted = () => {
+            if (outputStream.destroyed) {
+                callback(abortedError());
+                return true;
+            }
+            return false;
         };
         // for multipart nodes, push child nodes
         // for content nodes end the stream
         const finalize = () => {
             let childId = 0;
             const processChildNode = () => {
+                if (aborted()) {
+                    return;
+                }
                 if (childId >= this.childNodes.length) {
                     outputStream.write('\r\n--' + this.boundary + '--\r\n');
                     return callback();
@@ -45341,89 +46535,80 @@ class MimeNode {
         };
         // pushes node content
         const sendContent = () => {
-            if (this.content) {
-                if (Object.prototype.toString.call(this.content) === '[object Error]') {
-                    // content is already errored
-                    return callback(this.content);
-                }
-                if (typeof this.content.pipe === 'function') {
-                    this.content.removeListener('error', this._contentErrorHandler);
-                    this._contentErrorHandler = err => callback(err);
-                    this.content.once('error', this._contentErrorHandler);
-                }
-                const createStream = () => {
-                    if (['quoted-printable', 'base64'].includes(transferEncoding)) {
-                        contentStream = new (transferEncoding === 'base64' ? base64_namespaceObject : qp_namespaceObject).Encoder(options);
-                        contentStream.pipe(outputStream, {
-                            end: false
-                        });
-                        contentStream.once('end', finalize);
-                        contentStream.once('error', err => callback(err));
-                        localStream = this._getStream(this.content);
-                        localStream.pipe(contentStream);
-                    }
-                    else {
-                        // anything that is not QP or Base54 passes as-is
-                        localStream = this._getStream(this.content);
-                        localStream.pipe(outputStream, {
-                            end: false
-                        });
-                        localStream.once('end', finalize);
-                    }
-                    localStream.once('error', err => callback(err));
-                };
-                if (this.content._resolve) {
-                    const chunks = [];
-                    let chunklen = 0;
-                    let returned = false;
-                    const sourceStream = this._getStream(this.content);
-                    sourceStream.on('error', err => {
-                        if (returned) {
-                            return;
-                        }
-                        returned = true;
-                        callback(err);
-                    });
-                    sourceStream.on('readable', () => {
-                        let chunk;
-                        while ((chunk = sourceStream.read()) !== null) {
-                            chunks.push(chunk);
-                            chunklen += chunk.length;
-                        }
-                    });
-                    sourceStream.on('end', () => {
-                        if (returned) {
-                            return;
-                        }
-                        returned = true;
-                        this.content._resolve = false;
-                        this.content._resolvedValue = Buffer.concat(chunks, chunklen);
-                        setImmediate(createStream);
-                    });
-                }
-                else {
-                    setImmediate(createStream);
-                }
+            if (aborted()) {
                 return;
             }
-            return setImmediate(finalize);
+            if (!this.content) {
+                return setImmediate(finalize);
+            }
+            const createStream = () => {
+                if (aborted()) {
+                    return;
+                }
+                const contentError = this._takeStreamContent(this.content);
+                if (contentError) {
+                    return callback(contentError);
+                }
+                const localStream = this._getStream(this.content);
+                if (['quoted-printable', 'base64'].includes(transferEncoding)) {
+                    const contentStream = transferEncoding === 'base64'
+                        ? new Encoder(options)
+                        : // outside of text a lone CR or LF is data, encoding it keeps it from being
+                            // turned into a line break by a newline transform or the receiving side
+                            new qp_Encoder(Object.assign({}, options, { binary: !/^text\//i.test(this.contentType || '') }));
+                    readInto(localStream, contentStream);
+                    contentStream.pipe(outputStream, {
+                        end: false
+                    });
+                    // pipeline reports errors and tears both streams down. It calls back once the
+                    // encoder took all of its input, the encoded output may still be waiting to
+                    // be read, so the node is only done once the encoder's readable side ended
+                    (0,external_node_stream_.pipeline)(localStream, contentStream, err => err && callback(err));
+                    (0,external_node_stream_.finished)(contentStream, { writable: false }, err => (err ? callback(err) : finalize()));
+                }
+                else {
+                    // anything that is not QP or Base54 passes as-is
+                    readInto(localStream);
+                    localStream.pipe(outputStream, {
+                        end: false
+                    });
+                    (0,external_node_stream_.finished)(localStream, { writable: false }, err => (err ? callback(err) : finalize()));
+                }
+            };
+            if (this.content._resolve) {
+                const sourceStream = this._getStream(this.content);
+                readInto(sourceStream);
+                resolveStream(sourceStream, (err, value) => {
+                    if (err) {
+                        return callback(err);
+                    }
+                    if (returned) {
+                        return;
+                    }
+                    this.content._resolve = false;
+                    this.content._resolvedValue = value;
+                    setImmediate(createStream);
+                });
+            }
+            else {
+                setImmediate(createStream);
+            }
         };
         if (this._raw) {
             setImmediate(() => {
-                if (Object.prototype.toString.call(this._raw) === '[object Error]') {
-                    // content is already errored
-                    return callback(this._raw);
+                if (aborted()) {
+                    return;
                 }
-                // remove default error handler (if set)
-                if (typeof this._raw.pipe === 'function') {
-                    this._raw.removeListener('error', this._contentErrorHandler);
+                const rawError = this._takeStreamContent(this._raw);
+                if (rawError) {
+                    return callback(rawError);
                 }
                 const raw = this._getStream(this._raw);
+                readInto(raw);
                 raw.pipe(outputStream, {
                     end: false
                 });
-                raw.on('error', err => outputStream.emit('error', err));
-                raw.on('end', finalize);
+                (0,external_node_stream_.finished)(raw, { writable: false }, err => (err ? callback(err) : finalize()));
             });
         }
         else {
@@ -45539,11 +46724,7 @@ class MimeNode {
         if (this._raw && typeof this._raw.pipe === 'function') {
             // pre-stream handler. might be triggered if a stream is set as content
             // and 'error' fires before anything is done with this stream
-            this._contentErrorHandler = err => {
-                this._raw.removeListener('error', this._contentErrorHandler);
-                this._raw = err;
-            };
-            this._raw.once('error', this._contentErrorHandler);
+            recordStreamErrors(this._raw);
         }
         return this;
     }
@@ -45568,6 +46749,37 @@ class MimeNode {
             node = node.parentNode;
         }
         return false;
+    }
+    /**
+     * Destroys the content streams of this node and of every node below it
+     *
+     * @internal
+     */
+    _destroyContentStreams() {
+        destroyStream(this.content);
+        destroyStream(this._raw);
+        for (const child of this.childNodes) {
+            child._destroyContentStreams();
+        }
+    }
+    /**
+     * Checks that a content value can still be read before the node streams it. A stream is
+     * refused once it errored, ended or was destroyed: piping it would either never finish or
+     * produce an empty body without any error
+     *
+     * @param content Node content or raw value
+     * @returns The error to stop with, or null when the content can be read
+     * @internal
+     */
+    _takeStreamContent(content) {
+        if (Object.prototype.toString.call(content) === '[object Error]') {
+            return content;
+        }
+        if (!content || typeof content.pipe !== 'function' || content._resolvedValue) {
+            // the value of a resolved stream is read from the buffered copy
+            return null;
+        }
+        return unreadableStreamError(content);
     }
     /**
      * Detects and returns handle to a stream related with the content.
@@ -45687,7 +46899,7 @@ class MimeNode {
                 flattened.push(copy);
                 continue;
             }
-            const parsed = this._normalizeParsedAddresses(addressparser(address));
+            const parsed = this._normalizeParsedAddresses(esm_addressparser(address));
             for (let i = 0; i < parsed.length; i++) {
                 flattened.push(parsed[i]);
             }
@@ -45747,12 +46959,12 @@ class MimeNode {
     _normalizeHeaderKey(key) {
         key = (key || '')
             .toString()
-            // no newlines in keys
-            .replace(/\r?\n|\r/g, ' ')
-            // a field name is printable ascii without the colon, so a control char or DEL
-            // can only be dropped, there is no quoting construct around a field name
-            .replace(/[\x00-\x1f\x7f]/g, '')
-            .trim()
+            // a field name is printable ascii without the colon, so a control char, DEL,
+            // whitespace or a colon can only be dropped, there is no quoting construct
+            // around a field name. A colon or a space left in place ends the name early on
+            // the wire: the key 'From: ceo@example.com (' with the value ')' was emitted as a
+            // second From header that neither setHeader() nor the Bcc filter could match
+            .replace(/[\s\x00-\x20\x7f:]/g, '')
             .toLowerCase()
             // use uppercase words, except MIME
             .replace(/^X-SMTPAPI$|^(MIME|DKIM|ARC|BIMI)\b|^[a-z]|-(SPF|FBL|ID|MD5)$|-[a-z]/gi, c => c.toUpperCase())
@@ -45783,8 +46995,7 @@ class MimeNode {
             // where it came from. MimeNode is exported and subclassable, so the generator is
             // not necessarily the one below. Stripping twice costs nothing, it is idempotent.
             const declared = _stripBoundaryControls(structured.params.boundary || this.boundary || '');
-            this.boundary = structured.params.boundary =
-                declared || _stripBoundaryControls(this._generateBoundary());
+            this.boundary = structured.params.boundary = declared || _stripBoundaryControls(this._generateBoundary());
         }
         else {
             this.boundary = false;
@@ -45802,13 +47013,19 @@ class MimeNode {
         return _stripBoundaryControls(this.rootNode.boundaryPrefix + '-' + this.rootNode.baseBoundary) + '-Part_' + this._nodeId;
     }
     /**
-     * Encodes a header value for use in the generated rfc2822 email.
+     * Encodes a header value the way this node encodes it in the generated message:
+     * address headers are punycoded and mime encoded, message id headers get their
+     * angle brackets, a Date object is formatted and any other value is mime encoded
+     * when it holds non-ascii or control characters (using the node's `textEncoding`).
      *
-     * @param key Header key
+     * The result is a single unfolded line without the key. Fold it before writing it
+     * into a message, `key + ': ' + value` folded at 76 characters is what the node does.
+     *
+     * @param key Header key, case insensitive
      * @param value Header value
-     * @internal
+     * @returns Encoded header value
      */
-    _encodeHeaderValue(key, value) {
+    encodeHeaderValue(key, value) {
         key = this._normalizeHeaderKey(key);
         switch (key) {
             // Structured headers
@@ -45838,26 +47055,26 @@ class MimeNode {
                 }
                 return value;
             // space separated list of values enclosed in <>
-            case 'References':
-                value = [].concat
-                    .apply([], [].concat(value || '').map(elm => {
-                    elm = (elm || '')
+            case 'References': {
+                const ids = [];
+                for (const entry of [].concat(value || '')) {
+                    const elm = (entry || '')
                         .toString()
                         .replace(/\r?\n|\r/g, ' ')
                         .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
                         .trim();
-                    return elm.replace(/<[^>]*>/g, str => str.replace(/\s/g, '')).split(/\s+/);
-                }))
-                    .map(elm => {
-                    if (elm.charAt(0) !== '<') {
-                        elm = '<' + elm;
+                    for (let id of stripWhitespaceInAngleBrackets(elm).split(/\s+/)) {
+                        if (id.charAt(0) !== '<') {
+                            id = '<' + id;
+                        }
+                        if (id.charAt(id.length - 1) !== '>') {
+                            id = id + '>';
+                        }
+                        ids.push(id);
                     }
-                    if (elm.charAt(elm.length - 1) !== '>') {
-                        elm = elm + '>';
-                    }
-                    return elm;
-                });
-                return value.join(' ').trim();
+                }
+                return ids.join(' ').trim();
+            }
             case 'Date':
                 if (Object.prototype.toString.call(value) === '[object Date]') {
                     return value.toUTCString().replace(/GMT/, '+0000');
@@ -45874,10 +47091,32 @@ class MimeNode {
         }
     }
     /**
+     * Encodes a header value without a node at hand. Same as the instance method of a
+     * node created with the given options.
+     *
+     * @param key Header key, case insensitive
+     * @param value Header value
+     * @param [options] Encoding options
+     * @param [options.textEncoding] either 'Q' (the default) or 'B'
+     * @returns Encoded header value
+     */
+    static encodeHeaderValue(key, value, options) {
+        return new MimeNode(false, { textEncoding: options?.textEncoding }).encodeHeaderValue(key, value);
+    }
+    /**
+     * Alias of encodeHeaderValue, kept for callers that used the method before it was public
+     *
+     * @internal
+     */
+    _encodeHeaderValue(key, value) {
+        return this.encodeHeaderValue(key, value);
+    }
+    /**
      * Rebuilds address object using punycode and other adjustments
      *
      * @param addresses An array of address objects
      * @param [uniqueList] An array to be populated with addresses
+     * @param [seenAddresses] Addresses already added to uniqueList, shared with recursive calls to keep deduplication linear
      * @return address string
      * @internal
      */
@@ -45935,7 +47174,10 @@ class MimeNode {
             // callers use an empty value to detect a missing address
             return address;
         }
-        const lastAt = address.lastIndexOf('@');
+        // dtext includes '@', so a domain literal is split off at the '@' in front of it and
+        // not at the last one, which delivered 'a@[x@evil.com]' to evil.com
+        const literal = address.charAt(address.length - 1) === ']' ? mime_node_DOMAIN_LITERAL_TAIL.exec(address) : null;
+        const lastAt = literal ? address.length - literal[1].length - 1 : address.lastIndexOf('@');
         if (lastAt < 0) {
             // Bare username, there is no domain to split off
             return this._normalizeLocalPart(address);
@@ -46015,7 +47257,7 @@ class MimeNode {
     /**
      * If needed, mime encodes the name part
      *
-     * @param name Name part of an address
+     * @param value Name part of an address
      * @returns Mime word encoded string if needed
      * @internal
      */
@@ -46091,6 +47333,40 @@ class MimeNode {
 function isContentObject(value) {
     const content = value;
     return typeof value === 'object' && !!(content.content || content.path || content.href || content.raw);
+}
+/**
+ * Tells whether attachment content is a string or a Buffer that 7bit can describe: ASCII
+ * only, no NUL and no line over the 998 octets of RFC 5322. Anything else, a stream or a
+ * file path included, can not be checked here
+ */
+function fitsSevenBit(content) {
+    let at;
+    let length;
+    if (typeof content === 'string') {
+        at = i => content.charCodeAt(i);
+        length = content.length;
+    }
+    else if (Buffer.isBuffer(content)) {
+        at = i => content[i];
+        length = content.length;
+    }
+    else {
+        return false;
+    }
+    let lineLength = 0;
+    for (let i = 0; i < length; i++) {
+        const c = at(i);
+        if (c === 0 || c > 0x7f) {
+            return false;
+        }
+        if (c === 0x0a || c === 0x0d) {
+            lineLength = 0;
+        }
+        else if (++lineLength > 998) {
+            return false;
+        }
+    }
+    return true;
 }
 class MailComposer {
     constructor(mail) {
@@ -46174,8 +47450,11 @@ class MailComposer {
                 contentTransferEncoding = attachment.contentTransferEncoding;
             }
             else if (isMessageNode) {
-                // the content might include non-ASCII bytes but at this point we do not know it yet
-                contentTransferEncoding = '8bit';
+                // a message/* part can not be encoded (RFC 2046 5.2.1), so the label has to describe
+                // the content as it is. A stream or a file might hold non-ASCII bytes that can not be
+                // checked here, so only content at hand that fits 7bit is labelled as such
+                // content with an `encoding` is decoded later, so what it decodes to is not known here either
+                contentTransferEncoding = !attachment.encoding && fitsSevenBit(attachment.content) ? '7bit' : '8bit';
             }
             else {
                 contentTransferEncoding = 'base64'; // the default
@@ -46190,9 +47469,7 @@ class MailComposer {
             }
             else if (!isMessageNode && attachment.filename !== false) {
                 // a backslash separates as well, so a Windows path does not put the sender's directories in the headers
-                data.filename =
-                    (attachment.path || attachment.href || '').split(/[/\\]/).pop().split('?').shift() ||
-                        'attachment-' + (i + 1);
+                data.filename = (attachment.path || attachment.href || '').split(/[/\\]/).pop().split('?').shift() || 'attachment-' + (i + 1);
                 if (data.filename.indexOf('.') < 0) {
                     data.filename += '.' + mime_funcs_detectExtension(data.contentType);
                 }
@@ -46353,8 +47630,7 @@ class MailComposer {
         if (this.mail.icalEvent) {
             eventObject = Object.assign({}, this._getIcalEvent());
             eventObject.filename = false;
-            eventObject.contentType =
-                'text/calendar; charset=utf-8; method=' + (eventObject.method || 'PUBLISH').toString().trim().toUpperCase();
+            eventObject.contentType = 'text/calendar; charset=utf-8; method=' + (eventObject.method || 'PUBLISH').toString().trim().toUpperCase();
             if (!eventObject.headers) {
                 eventObject.headers = {};
             }
@@ -46382,8 +47658,7 @@ class MailComposer {
                 alternative = this._processDataUrl(alternative);
             }
             const data = {
-                contentType: alternative.contentType ||
-                    mime_funcs_detectMimeType(alternative.filename || alternative.path || alternative.href || 'txt'),
+                contentType: alternative.contentType || mime_funcs_detectMimeType(alternative.filename || alternative.path || alternative.href || 'txt'),
                 contentTransferEncoding: alternative.contentTransferEncoding
             };
             if (alternative.filename) {
@@ -46651,6 +47926,33 @@ class MailComposer {
 ;// CONCATENATED MODULE: ./node_modules/nodemailer/dist/esm/dkim/message-parser.js
 
 /**
+ * Drops the SP and HTAB from both ends of a field name.
+ *
+ * An index scan rather than `/^[ \t]+|[ \t]+$/g`, which retries the trailing branch at
+ * every offset of a blank run that is followed by other text: the run is consumed greedily,
+ * `$` fails, and the engine gives the characters back one at a time before moving on to
+ * start the same walk one offset further in. A field name carrying a 128 KiB run of spaces
+ * between two atoms took about 6.7 seconds to trim, and the cost grows with its square.
+ *
+ * Not `.trim()`, which takes the other Unicode spaces along: an NBSP in front of a field
+ * name would come off and select the name into the signed set, where the relaxed
+ * canonicalization in sign.ts deliberately leaves everything but SP and HTAB alone.
+ *
+ * @param str Field name to trim
+ * @return The field name without the surrounding SP and HTAB
+ */
+function _trimFieldName(str) {
+    let start = 0;
+    let end = str.length;
+    while (start < end && (str.charCodeAt(start) === 0x20 || str.charCodeAt(start) === 0x09)) {
+        start++;
+    }
+    while (end > start && (str.charCodeAt(end - 1) === 0x20 || str.charCodeAt(end - 1) === 0x09)) {
+        end--;
+    }
+    return str.slice(start, end);
+}
+/**
  * MessageParser instance is a transform stream that separates message headers
  * from the rest of the body. Headers are emitted with the 'headers' event. Message
  * body is passed on as the resulting stream.
@@ -46729,7 +48031,7 @@ class MessageParser extends external_node_stream_.Transform {
                 const chunk = data.slice(headerPos);
                 this.bodySize += chunk.length;
                 // this would be the first chunk of data sent downstream
-                setImmediate(() => this.push(chunk));
+                this.push(chunk);
             }
             return false;
         }
@@ -46758,7 +48060,7 @@ class MessageParser extends external_node_stream_.Transform {
             this.bodySize += chunk.length;
             this.push(chunk);
         }
-        setImmediate(callback);
+        callback();
     }
     /** @internal */
     _flush(callback) {
@@ -46792,14 +48094,12 @@ class MessageParser extends external_node_stream_.Transform {
         return lines
             .filter(line => /[^ \t\r]/.test(line))
             .map(line => ({
-            key: line
-                .substr(0, line.indexOf(':'))
-                .replace(/^[ \t]+|[ \t]+$/g, '')
-                .toLowerCase(),
+            key: _trimFieldName(line.substr(0, line.indexOf(':'))).toLowerCase(),
             line
         }));
     }
 }
+/* harmony default export */ const message_parser = (MessageParser);
 
 ;// CONCATENATED MODULE: ./node_modules/nodemailer/dist/esm/dkim/relaxed-body.js
 // streams through a message body and calculates relaxed body hash
@@ -46942,15 +48242,26 @@ class RelaxedBody extends external_node_stream_.Transform {
         callback();
     }
 }
+/* harmony default export */ const relaxed_body = (RelaxedBody);
 
 ;// CONCATENATED MODULE: ./node_modules/nodemailer/dist/esm/dkim/sign.js
 
 
 
+
+/**
+ * Error for a hashAlgo value the crypto module does not know
+ */
+function unsupportedHashAlgoError(hashAlgo) {
+    const err = new Error('Unsupported DKIM hash algorithm "' + hashAlgo + '"');
+    err.code = ECONFIG;
+    return err;
+}
 /**
  * Returns DKIM signature header line
  *
  * @param headers Parsed headers object from MessageParser
+ * @param hashAlgo Hash algorithm the body hash was calculated with, for example "sha256"
  * @param bodyHash Base64 encoded hash of the message
  * @param options DKIM options
  * @param options.domainName Domain name to be signed for
@@ -46971,7 +48282,13 @@ function sign(headers, hashAlgo, bodyHash, options) {
     const canonicalizedHeaderData = relaxedHeaders(headers, fieldNames, options.skipFields);
     const dkimHeader = generateDKIMHeader(options.domainName, options.keySelector, canonicalizedHeaderData.fieldNames, hashAlgo, bodyHash);
     canonicalizedHeaderData.headers += 'dkim-signature:' + relaxedHeaderLine(dkimHeader);
-    const signer = external_node_crypto_.createSign(('rsa-' + hashAlgo).toUpperCase());
+    let signer;
+    try {
+        signer = external_node_crypto_.createSign(('rsa-' + hashAlgo).toUpperCase());
+    }
+    catch (_E) {
+        throw unsupportedHashAlgoError(hashAlgo);
+    }
     // the header lines are 'binary' strings, so this reproduces the original header bytes
     signer.update(canonicalizedHeaderData.headers, 'latin1');
     let signature;
@@ -46984,6 +48301,7 @@ function sign(headers, hashAlgo, bodyHash, options) {
     return dkimHeader + signature.replace(/(^.{73}|.{75}(?!\r?\n|\r))/g, '$&\r\n ').trim();
 }
 sign.relaxedHeaders = relaxedHeaders;
+sign.unsupportedHashAlgoError = unsupportedHashAlgoError;
 /* harmony default export */ const dkim_sign = (sign);
 function generateDKIMHeader(domainName, keySelector, fieldNames, hashAlgo, bodyHash) {
     // the caller supplied tag values are interpolated straight into the tag list, and none of
@@ -47076,9 +48394,7 @@ class DKIMSigner {
         this.chunks = [];
         this.chunklen = 0;
         this.readPos = 0;
-        this.cachePath = this.cacheDir
-            ? external_node_path_namespaceObject.join(this.cacheDir, 'message.' + Date.now() + '-' + external_node_crypto_.randomBytes(14).toString('hex'))
-            : false;
+        this.cachePath = this.cacheDir ? external_node_path_namespaceObject.join(this.cacheDir, 'message.' + Date.now() + '-' + external_node_crypto_.randomBytes(14).toString('hex')) : false;
         this.cache = false;
         this.headers = false;
         this.bodyHash = false;
@@ -47088,51 +48404,67 @@ class DKIMSigner {
         this.output = output;
         this.output.usingCache = false;
         this.hasErrored = false;
-        this.input.on('error', err => {
+        this.input.on('error', err => this.fail(err));
+        // A consumer that goes away before the signed message was read in full destroys the
+        // output. Stop reading the input and drop the cache file instead of leaving them open
+        this.output.once('close', () => {
+            if (this.output.writableFinished) {
+                return;
+            }
             this.hasErrored = true;
+            this.input.unpipe();
+            this.input.destroy();
             this.cleanup();
-            output.emit('error', err);
         });
+    }
+    /**
+     * Ends the output with an error and releases the cache file
+     */
+    fail(err) {
+        this.hasErrored = true;
+        this.cleanup();
+        this.output.destroy(err);
     }
     cleanup() {
         if (!this.cache || !this.cachePath) {
             return;
         }
+        const cache = this.cache;
+        this.cache = false;
+        cache.destroy();
         external_node_fs_namespaceObject.unlink(this.cachePath, () => false);
     }
     createReadCache() {
         // pipe remainings to cache file
         this.cache = external_node_fs_namespaceObject.createReadStream(this.cachePath);
-        this.cache.once('error', err => {
-            this.cleanup();
-            this.output.emit('error', err);
-        });
+        this.cache.once('error', err => this.fail(err));
         this.cache.once('close', () => {
             this.cleanup();
         });
         this.cache.pipe(this.output);
     }
     sendNextChunk() {
+        while (!this.hasErrored) {
+            if (this.readPos >= this.chunks.length) {
+                if (!this.cache) {
+                    this.output.end();
+                    return;
+                }
+                return this.createReadCache();
+            }
+            const chunk = this.chunks[this.readPos++];
+            if (this.output.write(chunk) === false) {
+                this.output.once('drain', () => {
+                    this.sendNextChunk();
+                });
+                return;
+            }
+        }
+    }
+    sendSignedOutput() {
         if (this.hasErrored) {
             return;
         }
-        if (this.readPos >= this.chunks.length) {
-            if (!this.cache) {
-                this.output.end();
-                return;
-            }
-            return this.createReadCache();
-        }
-        const chunk = this.chunks[this.readPos++];
-        if (this.output.write(chunk) === false) {
-            this.output.once('drain', () => {
-                this.sendNextChunk();
-            });
-            return;
-        }
-        setImmediate(() => this.sendNextChunk());
-    }
-    sendSignedOutput() {
         let keyPos = 0;
         const signNextKey = () => {
             if (keyPos >= this.keys.length) {
@@ -47141,13 +48473,20 @@ class DKIMSigner {
                 return;
             }
             const key = this.keys[keyPos++];
-            const dkimField = dkim_sign(this.headers, this.hashAlgo, this.bodyHash, {
-                domainName: key.domainName,
-                keySelector: key.keySelector,
-                privateKey: key.privateKey,
-                headerFieldNames: this.options.headerFieldNames,
-                skipFields: this.options.skipFields
-            });
+            let dkimField;
+            try {
+                dkimField = dkim_sign(this.headers, this.hashAlgo, this.bodyHash, {
+                    domainName: key.domainName,
+                    keySelector: key.keySelector,
+                    privateKey: key.privateKey,
+                    headerFieldNames: this.options.headerFieldNames,
+                    skipFields: this.options.skipFields
+                });
+            }
+            catch (err) {
+                this.fail(err);
+                return;
+            }
             if (dkimField) {
                 this.output.write(Buffer.from(dkimField + '\r\n'));
             }
@@ -47161,10 +48500,10 @@ class DKIMSigner {
     }
     createWriteCache() {
         this.output.usingCache = true;
-        // pipe remainings to cache file
-        this.cache = external_node_fs_namespaceObject.createWriteStream(this.cachePath);
+        // pipe remainings to cache file. It holds the message body and cacheDir is often a
+        // shared directory such as /tmp, so nobody but the owner gets to read it
+        this.cache = external_node_fs_namespaceObject.createWriteStream(this.cachePath, { mode: 0o600 });
         this.cache.once('error', err => {
-            this.cleanup();
             // drain input
             this.relaxedBody.unpipe(this.cache);
             this.relaxedBody.on('readable', () => {
@@ -47172,19 +48511,20 @@ class DKIMSigner {
                     // do nothing
                 }
             });
-            this.hasErrored = true;
-            // emit error
-            this.output.emit('error', err);
+            this.fail(err);
         });
         this.cache.once('close', () => {
+            if (this.hasErrored) {
+                return;
+            }
             this.sendSignedOutput();
         });
         this.relaxedBody.removeAllListeners('readable');
         this.relaxedBody.pipe(this.cache);
     }
     signStream() {
-        this.parser = new MessageParser();
-        this.relaxedBody = new RelaxedBody({
+        this.parser = new message_parser();
+        this.relaxedBody = new relaxed_body({
             hashAlgo: this.hashAlgo
         });
         this.parser.on('headers', value => {
@@ -47247,7 +48587,15 @@ class DKIM {
         }
         const signer = new DKIMSigner(options, this.keys, inputStream, output);
         setImmediate(() => {
-            signer.signStream();
+            try {
+                signer.signStream();
+            }
+            catch (_E) {
+                // the body hash is created here, an unknown hashAlgo throws inside this timer
+                // where nothing else could catch it
+                signer.fail(dkim_sign.unsupportedHashAlgoError(signer.hashAlgo));
+                return;
+            }
             if (writeValue) {
                 setImmediate(() => {
                     inputStream.end(writeValue);
@@ -47272,12 +48620,16 @@ var external_node_tls_ = __nccwpck_require__(1692);
 // Cap the CONNECT response we buffer before the header terminator, so a proxy that
 // never sends \r\n\r\n cannot grow memory unboundedly before the socket times out.
 const MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
+// URL hostnames keep the brackets around an IPv6 literal, socket options and net.isIPv6 take it without
+const unbracket = (host) => (typeof host === 'string' && host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host);
 function httpProxyClient(proxyUrl, destinationPort, destinationHost, tlsOptions, callback) {
     if (typeof tlsOptions === 'function') {
         callback = tlsOptions;
         tlsOptions = {};
     }
     tlsOptions = tlsOptions || {};
+    // the error paths hand over the error alone
+    const done = callback;
     // Reject CRLF in the destination before it reaches the CONNECT request line
     // and Host header. A tainted host/port could otherwise inject additional
     // request headers into the proxy connection (HTTP request splitting).
@@ -47285,10 +48637,12 @@ function httpProxyClient(proxyUrl, destinationPort, destinationHost, tlsOptions,
     if (!destinationPort || /[\r\n]/.test(destinationHost)) {
         const err = new Error('Invalid proxy destination');
         err.code = EPROXY;
-        setImmediate(() => callback(err));
+        setImmediate(() => done(err));
         return;
     }
     const proxy = parse(proxyUrl);
+    // the CONNECT request line and the Host header take an IPv6 destination in brackets
+    const authority = (external_node_net_.isIPv6(unbracket(destinationHost)) ? '[' + unbracket(destinationHost) + ']' : destinationHost) + ':' + destinationPort;
     const connectOptions = {
         host: proxy.hostname,
         port: Number(proxy.port) ? Number(proxy.port) : proxy.protocol === 'https:' ? 443 : 80
@@ -47304,34 +48658,100 @@ function httpProxyClient(proxyUrl, destinationPort, destinationHost, tlsOptions,
     else {
         connect = external_node_net_.connect.bind(external_node_net_);
     }
+    // The handshake is bounded as a whole, a proxy that keeps sending a byte now and then can
+    // not hold the connection open past it
+    const timeout = Number(tlsOptions.timeout) || httpProxyClient.timeout || 30 * 1000;
     let socket;
-    // Error harness for initial connection. Once connection is established, the responsibility
-    // to handle errors is passed to whoever uses this socket
+    // Single settlement path for the handshake: every temporary listener and the timer are
+    // dropped exactly once. Once the tunnel is up, the responsibility to handle errors is passed
+    // to whoever uses this socket
     let finished = false;
-    const tempSocketErr = (err) => {
+    let timer;
+    const cleanup = () => {
+        clearTimeout(timer);
+        socket.removeListener('data', onSocketData);
+        socket.removeListener('error', fail);
+        socket.removeListener('close', onEarlyClose);
+    };
+    function fail(err) {
         if (finished) {
             return;
         }
         finished = true;
+        cleanup();
         try {
             socket.destroy();
         }
         catch (_E) {
             // ignore
         }
-        callback(err);
-    };
-    const timeoutErr = () => {
-        const err = new Error('Proxy socket timed out');
-        err.code = 'ETIMEDOUT';
-        tempSocketErr(err);
-    };
+        done(err);
+    }
+    function onEarlyClose() {
+        const err = new Error('Proxy closed the connection before the tunnel was established');
+        err.code = EPROXY;
+        fail(err);
+    }
+    // The response is collected as chunks and only the bytes that just arrived, together
+    // with the three before them, are searched for the end of the headers. Appending to a
+    // string and searching all of it again re-read the whole response on every chunk.
+    const chunks = [];
+    let received = 0;
+    let tail = '';
+    function onSocketData(chunk) {
+        if (finished) {
+            return;
+        }
+        const window = tail + chunk.toString('binary');
+        const windowEnd = window.indexOf('\r\n\r\n');
+        chunks.push(chunk);
+        received += chunk.length;
+        tail = window.slice(-3);
+        if (windowEnd < 0) {
+            if (received > MAX_RESPONSE_HEADER_BYTES) {
+                const err = new Error('Proxy response headers too large');
+                err.code = EPROXY;
+                fail(err);
+            }
+            return;
+        }
+        // Stop reading before anything is put back. A socket that keeps flowing would emit the
+        // bytes after the headers, a greeting the proxy sent together with its own response,
+        // before the next owner of the socket has a listener for them
+        socket.removeListener('data', onSocketData);
+        socket.pause();
+        const headerEnd = received - window.length + windowEnd;
+        const response = Buffer.concat(chunks, received);
+        if (response.length > headerEnd + 4) {
+            socket.unshift(response.subarray(headerEnd + 4));
+        }
+        // check response code
+        const match = response.toString('binary', 0, headerEnd).match(/^HTTP\/\d+\.\d+ (\d+)/i);
+        if (!match || (match[1] || '').charAt(0) !== '2') {
+            const err = new Error('Invalid response from proxy' + ((match && ': ' + match[1]) || ''));
+            err.code = EPROXY;
+            return fail(err);
+        }
+        // proxy connection is now established
+        finished = true;
+        cleanup();
+        // A fresh socket starts flowing once something listens for 'data', a paused one would
+        // not. Keep that behaviour for the next owner of the socket
+        const resumeOnData = (event) => {
+            if (event === 'data') {
+                socket.removeListener('newListener', resumeOnData);
+                socket.resume();
+            }
+        };
+        socket.on('newListener', resumeOnData);
+        return done(null, socket);
+    }
     socket = connect(connectOptions, () => {
         if (finished) {
             return;
         }
         const reqHeaders = {
-            Host: destinationHost + ':' + destinationPort,
+            Host: authority,
             Connection: 'close'
         };
         if (proxy.auth) {
@@ -47340,9 +48760,7 @@ function httpProxyClient(proxyUrl, destinationPort, destinationHost, tlsOptions,
         socket.write(
         // HTTP method
         'CONNECT ' +
-            destinationHost +
-            ':' +
-            destinationPort +
+            authority +
             ' HTTP/1.1\r\n' +
             // HTTP request headers
             Object.keys(reqHeaders)
@@ -47350,53 +48768,15 @@ function httpProxyClient(proxyUrl, destinationPort, destinationHost, tlsOptions,
                 .join('\r\n') +
             // End request
             '\r\n\r\n');
-        let headers = '';
-        const onSocketData = (chunk) => {
-            let match;
-            let remainder;
-            if (finished) {
-                return;
-            }
-            headers += chunk.toString('binary');
-            if ((match = headers.match(/\r\n\r\n/))) {
-                socket.removeListener('data', onSocketData);
-                remainder = headers.substr(match.index + match[0].length);
-                headers = headers.substr(0, match.index);
-                if (remainder) {
-                    socket.unshift(Buffer.from(remainder, 'binary'));
-                }
-                // proxy connection is now established
-                finished = true;
-                // check response code
-                match = headers.match(/^HTTP\/\d+\.\d+ (\d+)/i);
-                if (!match || (match[1] || '').charAt(0) !== '2') {
-                    try {
-                        socket.destroy();
-                    }
-                    catch (_E) {
-                        // ignore
-                    }
-                    const err = new Error('Invalid response from proxy' + ((match && ': ' + match[1]) || ''));
-                    err.code = EPROXY;
-                    return callback(err);
-                }
-                socket.removeListener('error', tempSocketErr);
-                socket.removeListener('timeout', timeoutErr);
-                socket.setTimeout(0);
-                return callback(null, socket);
-            }
-            if (headers.length > MAX_RESPONSE_HEADER_BYTES) {
-                socket.removeListener('data', onSocketData);
-                const err = new Error('Proxy response headers too large');
-                err.code = EPROXY;
-                return tempSocketErr(err);
-            }
-        };
         socket.on('data', onSocketData);
     });
-    socket.setTimeout(httpProxyClient.timeout || 30 * 1000);
-    socket.on('timeout', timeoutErr);
-    socket.once('error', tempSocketErr);
+    timer = setTimeout(() => {
+        const err = new Error('Proxy socket timed out');
+        err.code = ETIMEDOUT;
+        fail(err);
+    }, timeout);
+    socket.once('error', fail);
+    socket.once('close', onEarlyClose);
 }
 /* harmony default export */ const http_proxy_client = (httpProxyClient);
 
@@ -47474,8 +48854,7 @@ class MailMessage {
                 if (!attachment.filename) {
                     // a backslash separates as well, so a Windows path does not put the sender's directories in the headers
                     attachment.filename =
-                        (attachment.path || attachment.href || '').split(/[/\\]/).pop().split('?').shift() ||
-                            'attachment-' + (i + 1);
+                        (attachment.path || attachment.href || '').split(/[/\\]/).pop().split('?').shift() || 'attachment-' + (i + 1);
                     if (attachment.filename.indexOf('.') < 0) {
                         attachment.filename += '.' + mime_funcs_detectExtension(attachment.contentType);
                     }
@@ -47539,6 +48918,29 @@ class MailMessage {
         };
         setImmediate(() => resolveNext());
     }
+    /**
+     * Destroys the content streams of the message once sending failed. A stream that was not
+     * read to the end would otherwise keep the file or the socket behind it open
+     */
+    releaseStreams() {
+        const data = this.data;
+        const values = [data.html, data.text, data.watchHtml, data.amp, data.raw, data.icalEvent];
+        for (const key of ['attachments', 'alternatives']) {
+            if (Array.isArray(data[key])) {
+                // one at a time, spreading a long enough list into the arguments throws
+                for (const entry of data[key]) {
+                    values.push(entry);
+                }
+            }
+        }
+        for (const value of values) {
+            if (value && typeof value === 'object') {
+                destroyStream(value);
+                destroyStream(value.content);
+                destroyStream(value.raw);
+            }
+        }
+    }
     normalize(callback) {
         const envelope = this.message.getEnvelope();
         const messageId = this.message.messageId();
@@ -47587,7 +48989,7 @@ class MailMessage {
                 value = (value && value.value) || value;
                 if (value) {
                     if (['references', 'in-reply-to', 'message-id', 'content-id'].includes(key)) {
-                        value = this.message._encodeHeaderValue(key, value);
+                        value = this.message.encodeHeaderValue(key, value);
                     }
                     data.normalizedHeaders[key] = value;
                 }
@@ -47599,10 +49001,10 @@ class MailMessage {
                 });
             }
             if (data.references) {
-                data.normalizedHeaders.references = this.message._encodeHeaderValue('references', data.references);
+                data.normalizedHeaders.references = this.message.encodeHeaderValue('references', data.references);
             }
             if (data.inReplyTo) {
-                data.normalizedHeaders['in-reply-to'] = this.message._encodeHeaderValue('in-reply-to', data.inReplyTo);
+                data.normalizedHeaders['in-reply-to'] = this.message.encodeHeaderValue('in-reply-to', data.inReplyTo);
             }
             return callback(null, data);
         });
@@ -47671,7 +49073,7 @@ class MailMessage {
                             comment = needsEncoding ? encodeWord(comment) : quoteString(comment);
                             // List-ID expects a bare domain-like identifier, so strip the
                             // scheme prefix that _formatListUrl adds or passes through
-                            return ((value.comment ? comment + ' ' : '') + this._formatListUrl(value.url).replace(/^<[^:]+:\/{0,2}/, '<'));
+                            return (value.comment ? comment + ' ' : '') + this._formatListUrl(value.url).replace(/^<[^:]+:\/{0,2}/, '<');
                         }
                         // List-*: <http://domain> (comment)
                         // the ctext specials go out as quoted-pairs, otherwise a ")" closes the
@@ -47825,6 +49227,11 @@ class Mail extends external_node_events_.EventEmitter {
             this.getSocket = false;
         }
         const mail = new MailMessage(this, data);
+        // a failed message is not going to be read anymore, release its content streams
+        const fail = (err) => {
+            mail.releaseStreams();
+            done(err);
+        };
         this.logger.debug({
             tnx: 'transport',
             name: this.transporter.name,
@@ -47838,7 +49245,7 @@ class Mail extends external_node_events_.EventEmitter {
                     tnx: 'plugin',
                     action: 'compile'
                 }, 'PluginCompile Error: %s', err.message);
-                return done(err);
+                return fail(err);
             }
             let recipientCount;
             try {
@@ -47855,7 +49262,7 @@ class Mail extends external_node_events_.EventEmitter {
                     tnx: 'transport',
                     action: 'send'
                 }, 'Compile Error: %s', err.message);
-                return done(err);
+                return fail(err);
             }
             const maxRecipients = mail.data.maxRecipients === undefined ? DEFAULT_MAX_RECIPIENTS : mail.data.maxRecipients;
             if (maxRecipients && recipientCount > maxRecipients) {
@@ -47866,7 +49273,7 @@ class Mail extends external_node_events_.EventEmitter {
                     tnx: 'transport',
                     action: 'send'
                 }, 'Send Error: %s', err.message);
-                return done(err);
+                return fail(err);
             }
             this._processPlugins('stream', mail, err => {
                 if (err) {
@@ -47875,7 +49282,7 @@ class Mail extends external_node_events_.EventEmitter {
                         tnx: 'plugin',
                         action: 'stream'
                     }, 'PluginStream Error: %s', err.message);
-                    return done(err);
+                    return fail(err);
                 }
                 if (mail.data.dkim || this.dkim) {
                     mail.message.processFunc(input => {
@@ -47890,6 +49297,7 @@ class Mail extends external_node_events_.EventEmitter {
                 }
                 this.transporter.send(mail, (...args) => {
                     if (args[0]) {
+                        mail.releaseStreams();
                         this.logger.error({
                             err: args[0],
                             tnx: 'transport',
@@ -47957,6 +49365,11 @@ class Mail extends external_node_events_.EventEmitter {
         // setup socket handler for the mailer object
         this.getSocket = (options, callback) => {
             const protocol = proxy.protocol.replace(/:$/, '').toLowerCase();
+            // The proxy handshake is a part of connecting and draws from the same deadline as the
+            // SMTP connection that follows it: whatever the proxy takes, the connection does not get
+            const configuredTimeout = Number(this.options.connectionTimeout) || 0;
+            const connectStartedAt = Number(options.connectStartedAt) || Date.now();
+            const connectionTimeout = configuredTimeout ? Math.max(connectStartedAt + configuredTimeout - Date.now(), 1) : undefined;
             if (this.meta.has('proxy_handler_' + protocol)) {
                 return this.meta.get('proxy_handler_' + protocol)(proxy, options, callback);
             }
@@ -47964,7 +49377,7 @@ class Mail extends external_node_events_.EventEmitter {
                 // Connect using a HTTP CONNECT method
                 case 'http':
                 case 'https':
-                    http_proxy_client(proxy.href, options.port, options.host, this.options.tls || {}, (err, socket) => {
+                    http_proxy_client(proxy.href, options.port, options.host, connectionTimeout ? Object.assign({}, this.options.tls, { timeout: connectionTimeout }) : this.options.tls || {}, (err, socket) => {
                         if (err) {
                             return callback(err);
                         }
@@ -47998,6 +49411,9 @@ class Mail extends external_node_events_.EventEmitter {
                             },
                             command: 'connect'
                         };
+                        if (connectionTimeout) {
+                            connectionOpts.timeout = connectionTimeout;
+                        }
                         if (proxy.username || proxy.password) {
                             const username = proxy.username || '';
                             const password = proxy.password || '';
@@ -48027,11 +49443,13 @@ class Mail extends external_node_events_.EventEmitter {
                     if (external_node_net_.isIP(proxy.hostname)) {
                         return connect(proxy.hostname);
                     }
-                    return external_node_dns_.resolve(proxy.hostname, (err, address) => {
+                    // lookup goes through the hosts file and returns an IPv6 address as well,
+                    // the same way a connection to the proxy host would be resolved otherwise
+                    return external_node_dns_.lookup(proxy.hostname, (err, address) => {
                         if (err) {
                             return callback(err);
                         }
-                        connect(Array.isArray(address) ? address[0] : address);
+                        connect(address);
                     });
                 }
             }
@@ -48050,9 +49468,12 @@ class Mail extends external_node_events_.EventEmitter {
                 return callback(err);
             }
             let cidCounter = 0;
+            // the media type is a bounded token: a quote, whitespace, '>' or '<' ends the
+            // attribute value and with it the type, so one img tag never scans ahead to a
+            // ';' that belongs to a later tag, which was quadratic
             html = (html || '')
                 .toString()
-                .replace(/(<img\b[^<>]{0,1024} src\s{0,20}=[\s"']{0,20})(data:([^;]+);[^"'>\s]+)/gi, (match, prefix, dataUri, mimeType) => {
+                .replace(/(<img\b[^<>]{0,1024} src\s{0,20}=[\s"']{0,20})(data:([^;"'<>\s]{1,255});[^"'>\s]+)/gi, (match, prefix, dataUri, mimeType) => {
                 const cid = external_node_crypto_.randomBytes(10).toString('hex') + '@localhost';
                 if (!mail.data.attachments) {
                     mail.data.attachments = [];
@@ -48082,9 +49503,15 @@ class Mail extends external_node_events_.EventEmitter {
 
 ;// CONCATENATED MODULE: ./node_modules/nodemailer/dist/esm/smtp-connection/data-stream.js
 
+// bytes inserted into the output, shared as they are only ever copied by Buffer.concat
+const INSERT_LF = Buffer.from('\n');
+const INSERT_LF_DOT = Buffer.from('\n.');
+const INSERT_CR = Buffer.from('\r');
+const INSERT_DOT = Buffer.from('.');
 /**
  * Escapes dots in the beginning of lines. Ends the stream with <CR><LF>.<CR><LF>
- * Also makes sure that only <CR><LF> sequences are used for linebreaks
+ * Also makes sure that only <CR><LF> sequences are used for linebreaks, bare CR and bare LF
+ * are both turned into <CR><LF>
  *
  * @param options Stream options
  */
@@ -48113,33 +49540,35 @@ class DataStream extends external_node_stream_.Transform {
         }
         this.inByteCount += chunk.length;
         for (i = 0, len = chunk.length; i < len; i++) {
-            if (chunk[i] === 0x2e) {
-                // .
-                if ((i && chunk[i - 1] === 0x0a) || (!i && (!this.lastByte || this.lastByte === 0x0a))) {
-                    buf = chunk.slice(lastPos, i + 1);
-                    chunks.push(buf);
-                    chunks.push(Buffer.from('.'));
-                    chunklen += buf.length + 1;
-                    lastPos = i + 1;
-                }
+            const byte = chunk[i];
+            const prev = i ? chunk[i - 1] : this.lastByte;
+            let insert = false;
+            if (prev === 0x0d && byte !== 0x0a) {
+                // a bare CR becomes CRLF. A receiver that treats a lone CR as a line end would
+                // otherwise see "\r.\r" as the end of the data (SMTP smuggling), so a dot
+                // following it is stuffed like at the start of any other line
+                insert = byte === 0x2e ? INSERT_LF_DOT : INSERT_LF;
             }
-            else if (chunk[i] === 0x0a) {
-                // \n
-                if ((i && chunk[i - 1] !== 0x0d) || (!i && this.lastByte !== 0x0d)) {
-                    if (i > lastPos) {
-                        buf = chunk.slice(lastPos, i);
-                        chunks.push(buf);
-                        chunklen += buf.length + 2;
-                    }
-                    else {
-                        chunklen += 2;
-                    }
-                    chunks.push(Buffer.from('\r\n'));
-                    lastPos = i + 1;
+            else if (byte === 0x0a && prev !== 0x0d) {
+                // a bare LF becomes CRLF
+                insert = INSERT_CR;
+            }
+            else if (byte === 0x2e && (prev === 0x0a || prev === false)) {
+                // a dot at the start of a line
+                insert = INSERT_DOT;
+            }
+            if (insert) {
+                if (i > lastPos) {
+                    buf = chunk.slice(lastPos, i);
+                    chunks.push(buf);
+                    chunklen += buf.length;
                 }
+                chunks.push(insert);
+                chunklen += insert.length;
+                lastPos = i;
             }
         }
-        if (chunklen) {
+        if (chunks.length) {
             // add last piece
             if (lastPos < chunk.length) {
                 buf = chunk.slice(lastPos);
@@ -48177,7 +49606,61 @@ class DataStream extends external_node_stream_.Transform {
     }
 }
 
+;// CONCATENATED MODULE: ./node_modules/nodemailer/dist/esm/smtp-connection/server-message-id.js
+/**
+ * Reads the Message-ID a receiving server gave the message out of its final 250 reply. Some
+ * servers replace the Message-ID header of a submitted message with one of their own, and
+ * the copy the recipients and the sent folder get carries that one instead of the id the
+ * message was built with. Only replies in a format known to carry such an id are read.
+ */
+// Microsoft 365 and Outlook.com: "250 2.0.0 OK <id@host.prod.outlook.com> [Hostname=...]"
+const OUTLOOK_REPLY = /^250 2\.0\.0 OK (<[^<>\s]+\.prod\.outlook\.com>)/i;
+// Amazon SES: "250 Ok 0100018b5c3c0a4f-...-000000", the local part of the Message-ID it sets
+const SES_REPLY = /^250 Ok ([0-9a-f]+(?:-[0-9a-f]+)+)$/i;
+// an AWS region name such as us-east-1 or ap-southeast-2
+const AWS_REGION = /^[a-z]{2}(?:-[a-z]+)+-\d+$/;
+/**
+ * Finds the AWS region an SES SMTP endpoint is in from its hostname, such as
+ * email-smtp.eu-west-1.amazonaws.com or a VPC endpoint name under it
+ *
+ * @param host SMTP hostname
+ * @returns Region name, or undefined for a host outside amazonaws.com and awsapps.com
+ */
+function sesRegion(host) {
+    const labels = host.toLowerCase().replace(/\.$/, '').split('.');
+    const domain = labels.slice(-2).join('.');
+    if (domain !== 'amazonaws.com' && domain !== 'awsapps.com') {
+        return undefined;
+    }
+    return labels.slice(0, -2).find(label => AWS_REGION.test(label));
+}
+/**
+ * Reads the server assigned Message-ID out of the final reply to a message
+ *
+ * @param response Final server reply for the message
+ * @param [host] Hostname the connection was made to, SES replies are only read for an SES host
+ * @returns The Message-ID with its angle brackets, or undefined when the reply names none
+ */
+function parseServerMessageId(response, host) {
+    const reply = (response || '').toString().trim();
+    const outlook = reply.match(OUTLOOK_REPLY);
+    if (outlook) {
+        return outlook[1];
+    }
+    const ses = reply.match(SES_REPLY);
+    if (ses && host) {
+        const region = sesRegion(host);
+        if (region) {
+            // the SES Message-ID domain is email.amazonses.com in us-east-1 and the region elsewhere
+            return '<' + ses[1].toLowerCase() + '@' + (region === 'us-east-1' ? 'email' : region) + '.amazonses.com>';
+        }
+    }
+    return undefined;
+}
+
 ;// CONCATENATED MODULE: ./node_modules/nodemailer/dist/esm/smtp-connection/index.js
+
+
 
 
 
@@ -48192,7 +49675,24 @@ const CONNECTION_TIMEOUT = 2 * 60 * 1000; // how much to wait for the connection
 const SOCKET_TIMEOUT = 10 * 60 * 1000; // how much to wait for socket inactivity before disconnecting the client
 const GREETING_TIMEOUT = 30 * 1000; // how much to wait after connection is established but SMTP greeting is not receieved
 const DNS_TIMEOUT = 30 * 1000; // how much to wait for resolveHostname
+const CLOSE_TIMEOUT = 5 * 1000; // how much to wait for the server to close its side after we closed ours
+const KEEPALIVE_DELAY = 30 * 1000; // idle time before TCP keepalive probes start, keeps NAT mappings of idle connections alive
 const TEARDOWN_NOOP = () => { }; // reusable no-op handler for absorbing errors during socket teardown
+// Random order, so that connections spread over the addresses of a host
+function shuffle(list) {
+    const result = list.slice();
+    for (let i = result.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [result[i], result[j]] = [result[j], result[i]];
+    }
+    return result;
+}
+// Every timeout is reported with the ETIMEDOUT code, timeoutType tells which one it was
+function timeoutError(message, timeoutType) {
+    const err = new Error(message);
+    err.timeoutType = timeoutType;
+    return err;
+}
 // how many bytes a single server response may occupy while it is still being received.
 // Generous compared to any real reply, it only stops a peer that never completes one
 const MAX_RESPONSE_SIZE = 1024 * 1024;
@@ -48239,6 +49739,21 @@ function isPartialLine(line) {
     return /^\d+-/.test(line);
 }
 /**
+ * The log form of a command a custom authentication handler sends. Such a command carries
+ * the credentials in whatever shape its mechanism uses, so only an AUTH verb with its
+ * mechanism name is kept, the way the built-in mechanisms hide their own secrets.
+ *
+ * @param cmd Command the handler sends
+ * @return What the transaction log gets instead
+ */
+function maskAuthCommand(cmd) {
+    const match = (cmd || '').toString().match(/^AUTH\s+[^\s]+/i);
+    if (!match) {
+        return '/* secret */';
+    }
+    return match[0].length === cmd.length ? cmd : match[0] + ' /* secret */';
+}
+/**
  * Generates a SMTP connection object
  *
  * Optional options object takes the following possible properties:
@@ -48246,8 +49761,8 @@ function isPartialLine(line) {
  *  * **port** - is the port to connect to (defaults to 587 or 465)
  *  * **host** - is the hostname or IP address to connect to (defaults to 'localhost')
  *  * **secure** - use SSL
- *  * **ignoreTLS** - ignore server support for STARTTLS
- *  * **requireTLS** - forces the client to use STARTTLS
+ *  * **ignoreTLS** - ignore server support for STARTTLS (has no effect when requireTLS is set)
+ *  * **requireTLS** - forces the client to use STARTTLS, takes precedence over ignoreTLS and opportunisticTLS
  *  * **name** - the name of the client server
  *  * **localAddress** - outbound address to bind to (see: http://nodejs.org/api/net.html#net_net_connect_options_connectionlistener)
  *  * **greetingTimeout** - Time to wait in ms until greeting message is received from the server (defaults to 30 seconds)
@@ -48272,6 +49787,11 @@ class SMTPConnection extends external_node_events_.EventEmitter {
         this.id = external_node_crypto_.randomBytes(8).toString('base64').replace(/\W/g, '');
         this.stage = 'init';
         this.options = options || {};
+        if (this.options.requireTLS && (this.options.ignoreTLS || this.options.opportunisticTLS)) {
+            // requireTLS wins, a contradictory configuration must not quietly fall back to plaintext.
+            // Copied so the caller's (possibly shared) options object is left as it was
+            this.options = Object.assign({}, this.options, { ignoreTLS: false, opportunisticTLS: false });
+        }
         this.secureConnection = !!this.options.secure;
         this.alreadySecured = !!this.options.secured;
         this.port = Number(this.options.port) || (this.secureConnection ? 465 : 587);
@@ -48310,26 +49830,41 @@ class SMTPConnection extends external_node_events_.EventEmitter {
         this._maxAllowedSize = 0;
         this._responseActions = [];
         this._recipientQueue = [];
-        this._greetingTimeout = false;
-        this._connectionTimeout = false;
+        this._phaseTimer = false;
+        this._plaintextEhlo = false;
         this._destroyed = false;
         this._closing = false;
         this._currentDataStream = false;
+        this._pendingSend = false;
+        this._connectCallback = false;
         this._onSocketData = chunk => this._onData(chunk);
         this._onSocketError = error => this._onError(error, 'ESOCKET', false, 'CONN');
         this._onSocketClose = () => this._onClose();
         this._onSocketEnd = () => this._onEnd();
         this._onSocketTimeout = () => this._onTimeout();
-        this._onConnectionSocketError = err => this._onConnectionError(err, 'ESOCKET');
-        this._connectionAttemptId = 0;
+        this._onConnectionSocketError = err => this._onError(err, 'ESOCKET', false, 'CONN');
     }
     /**
      * Creates a connection to a SMTP server and sets up connection
      * listener
      */
     connect(connectCallback) {
+        if (this._connectCalled && !this._destroyed) {
+            // A connection is opened once. A second call would open a second socket over the
+            // first one and run the session handlers of both against the same state
+            const err = this._formatError('Cannot connect - connect() was already called for this connection', 'ECONNECTION', false, 'API');
+            if (typeof connectCallback === 'function') {
+                setImmediate(() => connectCallback(err));
+                return;
+            }
+            this.logger.warn({ tnx: 'smtp' }, '%s', err.message);
+            return;
+        }
+        this._connectCalled = true;
         if (typeof connectCallback === 'function') {
+            this._connectCallback = connectCallback;
             this.once('connect', () => {
+                this._connectCallback = false;
                 this.logger.debug({
                     tnx: 'smtp'
                 }, 'SMTP handshake finished');
@@ -48340,11 +49875,15 @@ class SMTPConnection extends external_node_events_.EventEmitter {
                 return connectCallback(this._formatError(isDestroyedMessage, 'ECONNECTION', false, 'CONN'));
             }
         }
+        // connectionTimeout covers the whole of connecting: the DNS lookup and every address tried
+        const connectionTimeout = this.options.connectionTimeout || CONNECTION_TIMEOUT;
+        // a transport that first opened a proxy connection for this one sets when that started
+        this._connectionDeadline = (this._connectStartedAt || Date.now()) + connectionTimeout;
         let opts = {
             port: this.port,
             host: this.host,
             allowInternalNetworkInterfaces: this.allowInternalNetworkInterfaces,
-            timeout: this.options.dnsTimeout || DNS_TIMEOUT
+            timeout: Math.min(this.options.dnsTimeout || DNS_TIMEOUT, connectionTimeout)
         };
         if (this.options.localAddress) {
             opts.localAddress = this.options.localAddress;
@@ -48373,7 +49912,6 @@ class SMTPConnection extends external_node_events_.EventEmitter {
             return this._resolveAndConnect(opts, _resolved => {
                 try {
                     this._socket.connect(this.port, this.host, () => {
-                        this._socket.setKeepAlive(true);
                         // a `secure` connection over a caller-provided socket must still
                         // perform the TLS handshake, otherwise AUTH and the message body
                         // would be sent in cleartext despite the caller requesting TLS
@@ -48405,9 +49943,40 @@ class SMTPConnection extends external_node_events_.EventEmitter {
                 }
             }
             return this._resolveAndConnect(opts, resolved => {
-                // Store fallback addresses for retry on connection failure
-                this._fallbackAddresses = (resolved._addresses || []).filter(addr => addr !== opts.host);
-                this._connectOpts = Object.assign({}, opts);
+                let addresses = resolved._addresses || [];
+                if (opts.localAddress) {
+                    // a socket bound to an address of one family can not reach the other one
+                    const localFamily = external_node_net_.isIPv6(opts.localAddress) ? 6 : 4;
+                    const sameFamily = addresses.filter(addr => external_node_net_.isIP(addr) === localFamily);
+                    addresses = sameFamily.length ? sameFamily : addresses;
+                }
+                if (addresses.length > 1) {
+                    // net.connect tries the addresses in turn and moves on to the next one when an
+                    // attempt fails or takes too long. With both families it starts on IPv6 and
+                    // alternates (RFC 8305), so a host with a broken IPv6 path costs a fraction of
+                    // a second instead of a whole connection timeout
+                    const ipv6 = addresses.filter(addr => external_node_net_.isIPv6(addr));
+                    const ipv4 = addresses.filter(addr => !external_node_net_.isIPv6(addr));
+                    const ordered = shuffle(ipv6).concat(shuffle(ipv4));
+                    opts.host = this.host;
+                    opts.autoSelectFamily = true;
+                    if (!ipv6.length || !ipv4.length) {
+                        // a slow address of the only family gets its share of the time, not the
+                        // quarter second meant for an address family that does not work
+                        const remaining = this._connectionDeadline - Date.now();
+                        opts.autoSelectFamilyAttemptTimeout = Math.max(Math.floor(remaining / ordered.length), 10);
+                    }
+                    opts.lookup = ((hostname, lookupOptions, callback) => {
+                        if (lookupOptions && lookupOptions.all) {
+                            const all = ordered.map(address => ({ address, family: external_node_net_.isIPv6(address) ? 6 : 4 }));
+                            return setImmediate(() => callback(null, all));
+                        }
+                        setImmediate(() => callback(null, ordered[0], external_node_net_.isIPv6(ordered[0]) ? 6 : 4));
+                    });
+                }
+                else if (addresses.length) {
+                    opts.host = addresses[0];
+                }
                 this._connectToHost(opts, this.secureConnection);
             });
         }
@@ -48454,20 +50023,9 @@ class SMTPConnection extends external_node_events_.EventEmitter {
         if (this._destroyed || this._closing) {
             return;
         }
-        this._connectionAttemptId++;
-        const currentAttemptId = this._connectionAttemptId;
-        const connectFn = secure
-            ? external_node_tls_.connect
-            : external_node_net_.connect;
+        const connectFn = secure ? external_node_tls_.connect : external_node_net_.connect;
         try {
-            this._socket = connectFn(opts, () => {
-                // Ignore callback if this is a stale connection attempt
-                if (this._connectionAttemptId !== currentAttemptId) {
-                    return;
-                }
-                this._socket.setKeepAlive(true);
-                this._onConnect();
-            });
+            this._socket = connectFn(opts, () => this._onConnect());
             this._setupConnectionHandlers();
         }
         catch (E) {
@@ -48480,51 +50038,37 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      * @internal
      */
     _setupConnectionHandlers() {
-        this._connectionTimeout = setTimeout(() => {
-            this._onConnectionError('Connection timeout', 'ETIMEDOUT');
-        }, this.options.connectionTimeout || CONNECTION_TIMEOUT);
+        this._startPhase(Math.max((this._connectionDeadline || Date.now()) - Date.now(), 0), timeoutError('Connection timeout', 'CONNECT_TIMEOUT'));
         this._socket.on('error', this._onConnectionSocketError);
     }
     /**
-     * Handles connection errors with fallback to alternative addresses
+     * Starts the timer of a connection phase: connecting, waiting for the greeting or a TLS
+     * upgrade. The phases follow one another, so starting one ends the one before
      *
-     * @param err Error object or message
-     * @param code Error code
+     * @param timeout Time the phase may take
+     * @param err Error to fail with when it takes longer
      * @internal
      */
-    _onConnectionError(err, code) {
-        clearTimeout(this._connectionTimeout);
-        // Check if we have fallback addresses to try
-        const canFallback = this._fallbackAddresses && this._fallbackAddresses.length && this.stage === 'init' && !this._destroyed;
-        if (!canFallback) {
-            // No more fallback addresses, report the error
-            this._onError(err, code, false, 'CONN');
-            return;
-        }
-        const nextHost = this._fallbackAddresses.shift();
-        this.logger.info({
-            tnx: 'network',
-            failedHost: this._connectOpts.host,
-            nextHost,
-            error: err.message || err
-        }, 'Connection to %s failed, trying %s', this._connectOpts.host, nextHost);
-        // Clean up current socket
-        if (this._socket) {
-            try {
-                this._socket.removeListener('error', this._onConnectionSocketError);
-                // Absorb any late teardown error (e.g. a TLS fallback socket emitting
-                // after destroy), mirroring the guard used in close()
-                this._socket.on('error', TEARDOWN_NOOP);
-                this._socket.destroy();
-            }
-            catch (_E) {
-                // ignore
-            }
-            this._socket = null;
-        }
-        // Update host and retry
-        this._connectOpts.host = nextHost;
-        this._connectToHost(this._connectOpts, this.secureConnection);
+    _startPhase(timeout, err) {
+        this._clearPhase();
+        this._phaseTimer = setTimeout(() => {
+            this._phaseTimer = false;
+            this._onError(err, 'ETIMEDOUT', false, 'CONN');
+        }, timeout);
+    }
+    /**
+     * Time the greeting or a STARTTLS upgrade may take: greetingTimeout, cut short by what is left
+     * of connectionTimeout
+     *
+     * @internal
+     */
+    _remainingSetupTime() {
+        return Math.min(this.options.greetingTimeout || GREETING_TIMEOUT, Math.max((this._connectionDeadline || Infinity) - Date.now(), 1));
+    }
+    /** @internal */
+    _clearPhase() {
+        clearTimeout(this._phaseTimer);
+        this._phaseTimer = false;
     }
     /**
      * Sends QUIT
@@ -48537,8 +50081,7 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      * Closes the connection to the server
      */
     close() {
-        clearTimeout(this._connectionTimeout);
-        clearTimeout(this._greetingTimeout);
+        this._clearPhase();
         this._responseActions = [];
         // allow to run this function only once
         if (this._closing) {
@@ -48561,6 +50104,18 @@ class SMTPConnection extends external_node_events_.EventEmitter {
             }
             this._currentDataStream = false;
         }
+        // Detach from the message stream as well and release whatever it reads from, the message
+        // can not be sent over this connection anymore. The listener is swapped for a no-op rather
+        // than removed, a stream destroyed with an error would otherwise throw it as unhandled
+        if (this._pendingSend) {
+            const { stream, onStreamError } = this._pendingSend;
+            if (stream) {
+                stream.removeListener('error', onStreamError);
+                stream.on('error', TEARDOWN_NOOP);
+                stream.destroy();
+            }
+            this._pendingSend = false;
+        }
         if (socket && !socket.destroyed) {
             try {
                 // Clear socket timeout to prevent timer leaks
@@ -48576,6 +50131,15 @@ class SMTPConnection extends external_node_events_.EventEmitter {
                 // sending cleartext after TLS shutdown triggers ERR_SSL_BAD_RECORD_TYPE)
                 socket.on('error', TEARDOWN_NOOP);
                 socket[closeMethod]();
+                if (closeMethod === 'end') {
+                    // end() only closes our side, a server that never closes its own would keep
+                    // the socket, and the process with it, around for good
+                    const closeTimer = setTimeout(() => socket.destroy(), CLOSE_TIMEOUT);
+                    if (typeof closeTimer.unref === 'function') {
+                        closeTimer.unref();
+                    }
+                    socket.once('close', () => clearTimeout(closeTimer));
+                }
             }
             catch (_E) {
                 // just ignore
@@ -48594,14 +50158,21 @@ class SMTPConnection extends external_node_events_.EventEmitter {
         this._auth = authData || {};
         // Select SASL authentication method
         this._authMethod = (this._auth.method || '').toString().trim().toUpperCase() || false;
+        // XOAUTH2 needs a token generator or a custom handler, without either the method
+        // can not be run even when it is the only one the server advertised
+        const canUseXOAuth2 = !!this._auth.oauth2 || this.customAuth.has('XOAUTH2');
         if (!this._authMethod && this._auth.oauth2 && !this._auth.credentials) {
             this._authMethod = 'XOAUTH2';
         }
         else if (!this._authMethod || (this._authMethod === 'XOAUTH2' && !this._auth.oauth2)) {
-            // use first supported
-            this._authMethod = (this._supportedAuth[0] || 'PLAIN').toUpperCase().trim();
+            // use the first supported method that can be run
+            const supported = this._supportedAuth.find(method => method !== 'XOAUTH2' || canUseXOAuth2);
+            this._authMethod = (supported || 'PLAIN').toUpperCase().trim();
         }
-        if (this._authMethod !== 'XOAUTH2' && (!this._auth.credentials || !this._auth.credentials.user || !this._auth.credentials.pass)) {
+        // a token login needs no credentials, every other method and every custom handler
+        // gets them filled in from the user and pass values
+        if ((this._authMethod !== 'XOAUTH2' || this.customAuth.has('XOAUTH2')) &&
+            (!this._auth.credentials || !this._auth.credentials.user || !this._auth.credentials.pass)) {
             if ((this._auth.user && this._auth.pass) || this.customAuth.has(this._authMethod)) {
                 this._auth.credentials = {
                     user: this._auth.user,
@@ -48638,42 +50209,45 @@ class SMTPConnection extends external_node_events_.EventEmitter {
                 returned = true;
                 callback(this._formatError(err, 'EAUTH', lastResponse, 'AUTH ' + this._authMethod));
             };
+            // one implementation serves both sendCommand overloads, the promise is returned
+            // exactly when no callback was given
+            const sendCommand = (cmd, done) => {
+                let promise;
+                if (!done) {
+                    promise = new Promise((resolve, reject) => {
+                        done = callbackPromise(resolve, reject);
+                    });
+                }
+                this._responseActions.push(str => {
+                    lastResponse = str;
+                    let codes = str.match(/^(\d+)(?:\s(\d+\.\d+\.\d+))?\s/);
+                    let data = {
+                        command: cmd,
+                        response: str
+                    };
+                    if (codes) {
+                        data.status = Number(codes[1]) || 0;
+                        if (codes[2]) {
+                            data.code = codes[2];
+                        }
+                        data.text = str.substr(codes[0].length);
+                    }
+                    else {
+                        data.text = str;
+                        data.status = 0; // just in case we need to perform numeric comparisons
+                    }
+                    done(null, data);
+                });
+                setImmediate(() => this._sendCommand(cmd, maskAuthCommand(cmd)));
+                return promise;
+            };
             const handlerResponse = handler({
                 auth: this._auth,
                 method: this._authMethod,
                 extensions: [].concat(this._supportedExtensions),
                 authMethods: [].concat(this._supportedAuth),
                 maxAllowedSize: this._maxAllowedSize || false,
-                sendCommand: (cmd, done) => {
-                    let promise;
-                    if (!done) {
-                        promise = new Promise((resolve, reject) => {
-                            done = callbackPromise(resolve, reject);
-                        });
-                    }
-                    this._responseActions.push(str => {
-                        lastResponse = str;
-                        let codes = str.match(/^(\d+)(?:\s(\d+\.\d+\.\d+))?\s/);
-                        let data = {
-                            command: cmd,
-                            response: str
-                        };
-                        if (codes) {
-                            data.status = Number(codes[1]) || 0;
-                            if (codes[2]) {
-                                data.code = codes[2];
-                            }
-                            data.text = str.substr(codes[0].length);
-                        }
-                        else {
-                            data.text = str;
-                            data.status = 0; // just in case we need to perform numeric comparisons
-                        }
-                        done(null, data);
-                    });
-                    setImmediate(() => this._sendCommand(cmd));
-                    return promise;
-                },
+                sendCommand: sendCommand,
                 resolve,
                 reject
             });
@@ -48727,46 +50301,52 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      *
      * @param envelope Envelope object, {from: addr, to: [addr]}
      * @param message String, Buffer or a Stream
-     * @param callback Callback to return once sending is completed
+     * @param done Callback to return once sending is completed
      */
     send(envelope, message, done) {
-        if (!message) {
-            return done(this._formatError('Empty message', 'EMESSAGE', false, 'API'));
-        }
-        const isDestroyedMessage = this._isDestroyedMessage('send message');
-        if (isDestroyedMessage) {
-            return done(this._formatError(isDestroyedMessage, 'ECONNECTION', false, 'API'));
-        }
-        // reject larger messages than allowed
-        if (this._maxAllowedSize && envelope.size > this._maxAllowedSize) {
-            setImmediate(() => {
-                done(this._formatError('Message size larger than allowed ' + this._maxAllowedSize, 'EMESSAGE', false, 'MAIL FROM'));
-            });
-            return;
-        }
-        // ensure that callback is only called once
+        // ensure that the callback is only called once. The public callback type has a
+        // required result, the error paths hand over the error alone
         let returned = false;
-        const callback = function (...args) {
+        const callback = (err, info) => {
             if (returned) {
                 return;
             }
             returned = true;
-            done(...args);
+            if (this._pendingSend && this._pendingSend.callback === callback) {
+                this._pendingSend = false;
+            }
+            done(err, info);
+        };
+        if (!message) {
+            return callback(this._formatError('Empty message', 'EMESSAGE', false, 'API'));
+        }
+        const isDestroyedMessage = this._isDestroyedMessage('send message');
+        if (isDestroyedMessage) {
+            return callback(this._formatError(isDestroyedMessage, 'ECONNECTION', false, 'API'));
+        }
+        // reject larger messages than allowed
+        if (this._maxAllowedSize && envelope.size > this._maxAllowedSize) {
+            setImmediate(() => {
+                callback(this._formatError('Message size larger than allowed ' + this._maxAllowedSize, 'EMESSAGE', false, 'MAIL FROM'));
+            });
+            return;
+        }
+        const pendingSend = {
+            callback,
+            stream: false,
+            onStreamError: err => callback(this._formatError(err, 'ESTREAM', false, 'API'))
         };
         if (typeof message.on === 'function') {
-            message.on('error', err => callback(this._formatError(err, 'ESTREAM', false, 'API')));
+            pendingSend.stream = message;
+            pendingSend.stream.on('error', pendingSend.onStreamError);
         }
+        this._pendingSend = pendingSend;
         const startTime = Date.now();
         this._setEnvelope(envelope, (err, info) => {
             if (err) {
-                // create passthrough stream to consume to prevent OOM
-                const stream = new external_node_stream_.PassThrough();
-                if (typeof message.pipe === 'function') {
-                    message.pipe(stream);
-                }
-                else {
-                    stream.write(message);
-                    stream.end();
+                // the message is not going to be sent, release whatever the stream reads from
+                if (typeof message.destroy === 'function') {
+                    message.destroy();
                 }
                 return callback(err);
             }
@@ -48775,11 +50355,23 @@ class SMTPConnection extends external_node_events_.EventEmitter {
                 if (err) {
                     return callback(err);
                 }
-                info.envelopeTime = envelopeTime - startTime;
-                info.messageTime = Date.now() - envelopeTime;
-                info.messageSize = stream.outByteCount;
-                info.response = str;
-                return callback(null, info);
+                // the envelope info becomes the send result once the timings are on it
+                const result = info;
+                result.envelopeTime = envelopeTime - startTime;
+                result.messageTime = Date.now() - envelopeTime;
+                result.messageSize = stream.outByteCount;
+                result.response = str;
+                const serverMessageId = parseServerMessageId(result.response, this.options.host);
+                if (serverMessageId) {
+                    result.serverMessageId = serverMessageId;
+                }
+                // an LMTP server answers the message once per recipient, so recipients can be
+                // refused after the envelope info was built without any rejected errors on it
+                const rejectedErrors = this._envelope?.rejectedErrors;
+                if (!result.rejectedErrors && rejectedErrors && rejectedErrors.length) {
+                    result.rejectedErrors = rejectedErrors;
+                }
+                return callback(null, result);
             });
             if (typeof message.pipe === 'function') {
                 message.pipe(stream);
@@ -48818,7 +50410,7 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      */
     _onConnect() {
         const socket = this._socket;
-        clearTimeout(this._connectionTimeout);
+        this._clearPhase();
         this.logger.info({
             tnx: 'network',
             localAddress: socket.localAddress,
@@ -48848,15 +50440,41 @@ class SMTPConnection extends external_node_events_.EventEmitter {
         socket.once('end', this._onSocketEnd);
         socket.setTimeout(this.options.socketTimeout || SOCKET_TIMEOUT);
         socket.on('timeout', this._onSocketTimeout);
-        this._greetingTimeout = setTimeout(() => {
-            // if still waiting for greeting, give up
-            if (this._socket && !this._destroyed && this._responseActions[0] === this._actionGreeting) {
-                this._onError('Greeting never received', 'ETIMEDOUT', false, 'CONN');
-            }
-        }, this.options.greetingTimeout || GREETING_TIMEOUT);
+        // keepalive also covers sockets handed over by a proxy or by the caller
+        if (typeof socket.setKeepAlive === 'function') {
+            socket.setKeepAlive(true, KEEPALIVE_DELAY);
+        }
+        // Commands are written in the batches they belong to (see cork() for PIPELINING), Nagle
+        // would only hold a write back until the server acknowledged the previous one. Against a
+        // server that delays its ACKs that costs 40ms on every message
+        if (typeof socket.setNoDelay === 'function') {
+            socket.setNoDelay(true);
+        }
+        // bounded by greetingTimeout and by what is left of connectionTimeout, which covers setting
+        // the session up from the DNS lookup to the end of a STARTTLS upgrade
+        this._startPhase(this._remainingSetupTime(), timeoutError('Greeting never received', 'GREETING_TIMEOUT'));
         this._responseActions.push(this._actionGreeting);
         // we have a 'data' listener set up so resume socket if it was paused
         socket.resume();
+    }
+    /**
+     * Ends the session after a 421 reply. The replies queued for commands sent along with the
+     * answered one are not going to come, so the message in flight is failed here
+     *
+     * @param str The 421 reply
+     * @internal
+     */
+    _onServerClosing(str) {
+        if (this._destroyed) {
+            return;
+        }
+        const pendingSend = this._pendingSend;
+        const envelope = this._envelope;
+        this._responseActions = [];
+        this.close();
+        if (pendingSend) {
+            pendingSend.callback((envelope && envelope.mailError) || this._formatError('Server closed the connection', 'ECONNECTION', str, 'CONN'));
+        }
     }
     /**
      * 'data' listener for data coming from the server
@@ -48927,11 +50545,12 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      * @event
      * @param err Error object
      * @param type Error name
+     * @param data Server response that triggered the error, false if there is none
+     * @param command SMTP command that was in flight
      * @internal
      */
     _onError(err, type, data, command) {
-        clearTimeout(this._connectionTimeout);
-        clearTimeout(this._greetingTimeout);
+        this._clearPhase();
         if (this._destroyed) {
             // just ignore, already closed
             // this might happen when a socket is canceled because of reached timeout
@@ -48939,15 +50558,21 @@ class SMTPConnection extends external_node_events_.EventEmitter {
             return;
         }
         err = this._formatError(err, type, data, command);
-        const transientCodes = ['ETIMEDOUT', 'ESOCKET', 'ECONNECTION'];
-        if (transientCodes.includes(err.code)) {
-            this.logger.warn(data, err.message);
+        // the message carries the server response, it is an argument and not the format string
+        if (isTransientError(err)) {
+            this.logger.warn({ tnx: 'smtp', err }, '%s', err.message);
         }
         else {
-            this.logger.error(data, err.message);
+            this.logger.error({ tnx: 'smtp', err }, '%s', err.message);
         }
+        // close() forgets the send in flight, it is completed with this same error afterwards so
+        // a late message stream error has nothing left to report
+        const pendingSend = this._pendingSend;
         this.emit('error', err);
         this.close();
+        if (pendingSend) {
+            pendingSend.callback(err);
+        }
     }
     /** @internal */
     _formatError(message, type, response, command) {
@@ -48958,7 +50583,12 @@ class SMTPConnection extends external_node_events_.EventEmitter {
         else {
             err = new Error(message);
         }
-        if (type && type !== 'Error') {
+        // a permission model denial keeps its own code, see ERR_ACCESS_DENIED
+        if (type && type !== 'Error' && err.code !== ERR_ACCESS_DENIED) {
+            // the code of a system error, such as ECONNREFUSED, still tells what happened
+            if (err.code && err.code !== type && !err.originalCode) {
+                err.originalCode = err.code;
+            }
             err.code = type;
         }
         if (response) {
@@ -48968,6 +50598,7 @@ class SMTPConnection extends external_node_events_.EventEmitter {
         const responseCode = (typeof response === 'string' && Number((response.match(/^\d+/) || [])[0])) || false;
         if (responseCode) {
             err.responseCode = responseCode;
+            err.permanent = isPermanentResponseCode(responseCode);
         }
         if (command) {
             err.command = command;
@@ -48993,14 +50624,33 @@ class SMTPConnection extends external_node_events_.EventEmitter {
         this.logger.info({
             tnx: 'network'
         }, 'Connection closed');
+        // the unterminated remainder is only reported as a reply (and so gives the error a responseCode)
+        // when it starts like a complete failure reply, not for a fragment such as "55" or a 250
+        const failureResponse = typeof serverResponse === 'string' && /^[45]\d{2}[ -]/.test(serverResponse) ? serverResponse : false;
         if (this.upgrading && !this._destroyed) {
-            return this._onError(new Error('Connection closed unexpectedly'), 'ETLS', serverResponse, 'CONN');
+            return this._onError(new Error('Connection closed unexpectedly'), 'ETLS', failureResponse, 'CONN');
         }
-        else if (![this._actionGreeting, this.close].includes(this._responseActions[0]) && !this._destroyed) {
-            return this._onError(new Error('Connection closed unexpectedly'), 'ECONNECTION', serverResponse, 'CONN');
+        if (!failureResponse && this._responseActions[0] === this._actionGreeting && this._connectCallback && !this._destroyed) {
+            // A silent close before the greeting is handed to the connect() callback rather than
+            // emitted as 'error', callers that never saw an error for it must not start throwing one
+            const connectCallback = this._connectCallback;
+            this._connectCallback = false;
+            const err = this._formatError(new Error('Connection closed unexpectedly'), 'ECONNECTION', false, 'CONN');
+            this.logger.warn({ tnx: 'network' }, err.message);
+            connectCallback(err);
+            this.close();
+            return;
         }
-        else if (/^[45]\d{2}\b/.test(serverResponse)) {
-            return this._onError(new Error('Connection closed unexpectedly'), 'ECONNECTION', serverResponse, 'CONN');
+        if (!failureResponse && this.stage === 'connected' && !this._responseActions.length && !this._pendingSend && !this._destroyed && !this._closing) {
+            // nothing was waiting for the server, so this is the server ending an idle session
+            // (usually after its idle timeout), not a failure
+            this.logger.info({
+                tnx: 'network'
+            }, 'Server closed the idle connection');
+            return this._destroy();
+        }
+        if (failureResponse || (this._responseActions[0] !== this.close && !this._destroyed)) {
+            return this._onError(new Error('Connection closed unexpectedly'), 'ECONNECTION', failureResponse, 'CONN');
         }
         this._destroy();
     }
@@ -49024,7 +50674,7 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      * @internal
      */
     _onTimeout() {
-        return this._onError(new Error('Timeout'), 'ETIMEDOUT', false, 'CONN');
+        return this._onError(timeoutError('Timeout', 'SOCKET_TIMEOUT'), 'ETIMEDOUT', false, 'CONN');
     }
     /**
      * Destroys the client, emits 'end'
@@ -49039,10 +50689,7 @@ class SMTPConnection extends external_node_events_.EventEmitter {
         this.destroyed = true;
         // a connection the server dropped before the greeting would otherwise keep
         // the greeting timer, and with it the process, alive until it fires
-        clearTimeout(this._connectionTimeout);
-        clearTimeout(this._greetingTimeout);
-        this._connectionTimeout = false;
-        this._greetingTimeout = false;
+        this._clearPhase();
         this.emit('end');
     }
     /**
@@ -49059,6 +50706,15 @@ class SMTPConnection extends external_node_events_.EventEmitter {
         // inject plaintext bytes after the "220" reply (e.g. a CRLF-free fragment that
         // would otherwise be prepended to the first post-TLS response and parsed as
         // part of the secured EHLO capabilities). STARTTLS response injection.
+        const discarded = this._remainder.length + this._responseQueue.reduce((total, response) => total + response.length, 0);
+        if (discarded) {
+            // a server does not send anything here on its own, this is worth knowing about
+            this.logger.warn({
+                tnx: 'smtp',
+                discarded
+            }, 'Discarded %s bytes received in plaintext after the STARTTLS response', discarded);
+        }
+        this._plaintextEhlo = false;
         this._remainder = '';
         this._responseQueue = [];
         this._responsePartial = false;
@@ -49068,6 +50724,7 @@ class SMTPConnection extends external_node_events_.EventEmitter {
         const socketPlain = this._socket;
         socketPlain.removeListener('data', this._onSocketData); // incoming data is going to be gibberish from this point onwards
         socketPlain.removeListener('timeout', this._onSocketTimeout); // timeout will be re-set for the new socket object
+        socketPlain.setTimeout(0);
         const opts = Object.assign({
             socket: socketPlain,
             host: this.host
@@ -49088,9 +50745,14 @@ class SMTPConnection extends external_node_events_.EventEmitter {
             socketPlain.removeListener('error', this._onConnectionSocketError);
         };
         this.upgrading = true;
+        // the socket timeout only notices a server that sends nothing at all, a handshake that
+        // trickles along would otherwise hold the connection for as long as the server likes
+        // STARTTLS is the last step of setting the session up
+        this._startPhase(this._remainingSetupTime(), timeoutError('TLS handshake timed out', 'UPGRADE_TIMEOUT'));
         // tls.connect is not an asynchronous function however it may still throw errors and requires to be wrapped with try/catch
         try {
             this._socket = external_node_tls_.connect(opts, () => {
+                this._clearPhase();
                 this.secure = true;
                 this.upgrading = false;
                 this._socket.on('data', this._onSocketData);
@@ -49099,6 +50761,7 @@ class SMTPConnection extends external_node_events_.EventEmitter {
             });
         }
         catch (err) {
+            this._clearPhase();
             removePlainSocketListeners();
             return callback(err);
         }
@@ -49139,9 +50802,23 @@ class SMTPConnection extends external_node_events_.EventEmitter {
             }, str.replace(/\r?\n$/, ''));
         }
         const action = this._responseActions.shift();
+        // RFC 5321 4.2: 421 means the server is about to close the connection, whatever it answers
+        const closing = /^421[ -]/.test(str);
         if (typeof action === 'function') {
+            // the command gets its own error first, the code tells which step failed
             action.call(this, str);
+            if (closing) {
+                return this._onServerClosing(str);
+            }
             setImmediate(() => this._processResponse());
+        }
+        else if (closing && !this._pendingSend && this.stage === 'connected') {
+            // RFC 5321 4.2: a server may send 421 at any time when it is about to close the
+            // connection. Nothing was waiting for a reply, so this ends an idle session
+            this.logger.info({
+                tnx: 'smtp'
+            }, 'Server closed the idle connection: %s', str);
+            this.close();
         }
         else {
             return this._onError(new Error('Unexpected Response'), 'EPROTOCOL', str, 'CONN');
@@ -49178,15 +50855,14 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      *        {from:'...', to:['...']}
      *        or
      *        {from:{address:'...',name:'...'}, to:[address:'...',name:'...']}
+     * @param callback Callback to run once the envelope is processed
      * @internal
      */
     _setEnvelope(envelope, callback) {
         const args = [];
         let useSmtpUtf8 = false;
         this._envelope = (envelope || {});
-        this._envelope.from = ((this._envelope.from && this._envelope.from.address) || this._envelope.from || '')
-            .toString()
-            .trim();
+        this._envelope.from = ((this._envelope.from && this._envelope.from.address) || this._envelope.from || '').toString().trim();
         this._envelope.to = []
             .concat(this._envelope.to || [])
             .map(to => ((to && to.address) || to || '').toString().trim());
@@ -49236,6 +50912,9 @@ class SMTPConnection extends external_node_events_.EventEmitter {
                 return callback(this._formatError('Server does not support REQUIRETLS extension (RFC 8689)', 'EREQUIRETLS', false, 'MAIL FROM'));
             }
         }
+        // RFC 2920: with PIPELINING the whole envelope and DATA go out without waiting for the
+        // replies in between, which saves two round trips for every message
+        this._envelope.pipelined = this._supportedExtensions.includes('PIPELINING');
         this._responseActions.push(str => {
             this._actionMAIL(str, callback);
         });
@@ -49273,7 +50952,38 @@ class SMTPConnection extends external_node_events_.EventEmitter {
         if (this._envelope.requireTLSExtensionEnabled) {
             args.push('REQUIRETLS');
         }
-        this._sendCommand('MAIL FROM:<' + this._envelope.from + '>' + (args.length ? ' ' + args.join(' ') : ''));
+        const mailFrom = 'MAIL FROM:<' + this._envelope.from + '>' + (args.length ? ' ' + args.join(' ') : '');
+        this._recipientQueue = [];
+        if (!this._envelope.pipelined) {
+            this._sendCommand(mailFrom);
+            return;
+        }
+        // corked, so the batch leaves in one segment instead of the first command alone
+        const socket = this._socket;
+        socket.cork();
+        this._sendCommand(mailFrom);
+        while (this._envelope.rcptQueue.length) {
+            this._sendRcpt(this._envelope.rcptQueue.shift(), callback);
+        }
+        this._responseActions.push(str => {
+            this._actionDATA(str, callback);
+        });
+        this._sendCommand('DATA');
+        socket.uncork();
+    }
+    /**
+     * Sends RCPT TO for a recipient and queues the handler for the reply
+     *
+     * @param recipient Recipient address
+     * @param callback Callback to run once the envelope is processed
+     * @internal
+     */
+    _sendRcpt(recipient, callback) {
+        this._recipientQueue.push(recipient);
+        this._responseActions.push(str => {
+            this._actionRCPT(str, callback);
+        });
+        this._sendCommand('RCPT TO:<' + recipient + '>' + this._getDsnRcptToArgs());
     }
     /** @internal */
     _setDsnEnvelope(params) {
@@ -49389,7 +51099,7 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      * @internal
      */
     _actionGreeting(str) {
-        clearTimeout(this._greetingTimeout);
+        this._clearPhase();
         if (str.substr(0, 3) !== '220') {
             this._onError(new Error('Invalid greeting. response=' + str), 'EPROTOCOL', str, 'CONN');
             return;
@@ -49427,7 +51137,6 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      * @internal
      */
     _actionEHLO(str) {
-        let match;
         if (str.substr(0, 3) === '421') {
             this._onError(new Error('Server terminates connection. response=' + str), 'ECONNECTION', str, 'EHLO');
             return;
@@ -49442,17 +51151,30 @@ class SMTPConnection extends external_node_events_.EventEmitter {
             this._sendCommand('HELO ' + this.name);
             return;
         }
+        // Detect if the server supports STARTTLS
+        if (!this.secure && !this.options.ignoreTLS && (/[ -]STARTTLS\b/im.test(str) || this.options.requireTLS)) {
+            // kept for opportunisticTLS, a session that stays in plaintext still has these extensions
+            this._plaintextEhlo = str;
+            this._sendCommand('STARTTLS');
+            this._responseActions.push(this._actionSTARTTLS);
+            return;
+        }
+        this._parseEhloExtensions(str);
+        this.emit('connect');
+    }
+    /**
+     * Reads the extensions and the authentication mechanisms out of an EHLO response
+     *
+     * @param str EHLO response from the server
+     * @internal
+     */
+    _parseEhloExtensions(str) {
+        let match;
         this._ehloLines = str
             .split(/\r?\n/)
             .map(line => line.replace(/^\d+[ -]/, '').trim())
             .filter(line => line)
             .slice(1);
-        // Detect if the server supports STARTTLS
-        if (!this.secure && !this.options.ignoreTLS && (/[ -]STARTTLS\b/im.test(str) || this.options.requireTLS)) {
-            this._sendCommand('STARTTLS');
-            this._responseActions.push(this._actionSTARTTLS);
-            return;
-        }
         // Detect if the server supports SMTPUTF8
         if (/[ -]SMTPUTF8\b/im.test(str)) {
             this._supportedExtensions.push('SMTPUTF8');
@@ -49477,28 +51199,31 @@ class SMTPConnection extends external_node_events_.EventEmitter {
         if (/[ -]AUTH\b/i.test(str)) {
             this.allowsAuth = true;
         }
-        // Detect if the server supports PLAIN auth
-        if (/[ -]AUTH(?:(\s+|=)[^\n]*\s+|\s+|=)PLAIN/i.test(str)) {
-            this._supportedAuth.push('PLAIN');
+        // Detect the advertised SASL mechanisms. The list is split into whole tokens rather
+        // than searched for each name with a pattern: the patterns this replaced let two
+        // whitespace runs overlap and backtracked quadratically over an AUTH line padded with
+        // spaces, so a hostile server could stall the event loop from its EHLO reply
+        // (GHSA-4ffr-jq9g-5ffx).
+        const authMechanisms = new Set();
+        for (const line of this._ehloLines) {
+            const authMatch = /^AUTH[\s=](.*)/i.exec(line);
+            if (authMatch) {
+                for (const mechanism of authMatch[1].split(/[\s=]+/)) {
+                    authMechanisms.add(mechanism.toUpperCase());
+                }
+            }
         }
-        // Detect if the server supports LOGIN auth
-        if (/[ -]AUTH(?:(\s+|=)[^\n]*\s+|\s+|=)LOGIN/i.test(str)) {
-            this._supportedAuth.push('LOGIN');
-        }
-        // Detect if the server supports CRAM-MD5 auth
-        if (/[ -]AUTH(?:(\s+|=)[^\n]*\s+|\s+|=)CRAM-MD5/i.test(str)) {
-            this._supportedAuth.push('CRAM-MD5');
-        }
-        // Detect if the server supports XOAUTH2 auth
-        if (/[ -]AUTH(?:(\s+|=)[^\n]*\s+|\s+|=)XOAUTH2/i.test(str)) {
-            this._supportedAuth.push('XOAUTH2');
+        // listed in order of preference, the first one the credentials allow is used
+        for (const mechanism of ['PLAIN', 'LOGIN', 'CRAM-MD5', 'XOAUTH2']) {
+            if (authMechanisms.has(mechanism)) {
+                this._supportedAuth.push(mechanism);
+            }
         }
         // Detect if the server supports SIZE extensions (and the max allowed size)
         if ((match = str.match(/[ -]SIZE(?:[ \t]+(\d+))?/im))) {
             this._supportedExtensions.push('SIZE');
             this._maxAllowedSize = Number(match[1]) || 0;
         }
-        this.emit('connect');
     }
     /**
      * Handles server response for HELO command. If it yielded in
@@ -49530,6 +51255,14 @@ class SMTPConnection extends external_node_events_.EventEmitter {
                 this.logger.info({
                     tnx: 'smtp'
                 }, 'Failed STARTTLS upgrade, continuing unencrypted');
+                // the plaintext session goes on with what the server announced for it, except for
+                // AUTH: credentials are not sent over a connection that failed to encrypt
+                if (this._plaintextEhlo) {
+                    this._parseEhloExtensions(this._plaintextEhlo);
+                    this._plaintextEhlo = false;
+                    this.allowsAuth = false;
+                    this._supportedAuth = [];
+                }
                 this.emit('connect');
                 return;
             }
@@ -49568,6 +51301,7 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      * hosts invalidly use a longer message than VXNlcm5hbWU6
      *
      * @param str Message from the server
+     * @param callback Callback to run once the authentication sequence completes
      * @internal
      */
     _actionAUTH_LOGIN_USER(str, callback) {
@@ -49589,6 +51323,7 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      * base64 encoded again.
      *
      * @param str Message from the server
+     * @param callback Callback to run once the authentication sequence completes
      * @internal
      */
     _actionAUTH_CRAM_MD5(str, callback) {
@@ -49613,6 +51348,7 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      * the user can be considered logged in. Start waiting for a message to send
      *
      * @param str Message from the server
+     * @param callback Callback to run once the authentication sequence completes
      * @internal
      */
     _actionAUTH_CRAM_MD5_PASS(str, callback) {
@@ -49634,6 +51370,7 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      * response needs to be base64 encoded password.
      *
      * @param str Message from the server
+     * @param callback Callback to run once the authentication sequence completes
      * @internal
      */
     _actionAUTH_LOGIN_PASS(str, callback) {
@@ -49653,6 +51390,8 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      * the user can be considered logged in. Start waiting for a message to send
      *
      * @param str Message from the server
+     * @param isRetry True if this is a retry after a failed login, or the callback itself
+     * @param [callback] Callback to run once the authentication sequence completes
      * @internal
      */
     _actionAUTHComplete(str, isRetry, callback) {
@@ -49695,6 +51434,7 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      * Handle response for a MAIL FROM: command
      *
      * @param str Message from the server
+     * @param callback Callback to run once the envelope is processed
      * @internal
      */
     _actionMAIL(str, callback) {
@@ -49703,26 +51443,15 @@ class SMTPConnection extends external_node_events_.EventEmitter {
             const message = this._usingSmtpUtf8 && /^550 /.test(str) && /[\x80-\uFFFF]/.test(envelope.from)
                 ? 'Internationalized mailbox name not allowed'
                 : 'Mail command failed';
-            return callback(this._formatError(message, 'EENVELOPE', str, 'MAIL FROM'));
+            envelope.mailError = this._formatError(message, 'EENVELOPE', str, 'MAIL FROM');
         }
-        if (!envelope.rcptQueue.length) {
-            return callback(this._formatError("Can't send mail - no recipients defined", 'EENVELOPE', false, 'API'));
-        }
-        this._recipientQueue = [];
-        const usePipelining = this._supportedExtensions.includes('PIPELINING');
-        do {
-            const curRecipient = envelope.rcptQueue.shift();
-            this._recipientQueue.push(curRecipient);
-            this._responseActions.push(str => {
-                this._actionRCPT(str, callback);
-            });
-            this._sendCommand('RCPT TO:<' + curRecipient + '>' + this._getDsnRcptToArgs());
-        } while (usePipelining && envelope.rcptQueue.length);
+        this._advanceEnvelope(str, callback);
     }
     /**
      * Handle response for a RCPT TO: command
      *
      * @param str Message from the server
+     * @param callback Callback to run once the envelope is processed
      * @internal
      */
     _actionRCPT(str, callback) {
@@ -49743,37 +51472,98 @@ class SMTPConnection extends external_node_events_.EventEmitter {
         else {
             envelope.accepted.push(curRecipient);
         }
-        if (!envelope.rcptQueue.length && !this._recipientQueue.length) {
-            if (envelope.rejected.length < envelope.to.length) {
-                this._responseActions.push(str => {
-                    this._actionDATA(str, callback);
-                });
-                this._sendCommand('DATA');
-            }
-            else {
-                err = this._formatError("Can't send mail - all recipients were rejected", 'EENVELOPE', str, 'RCPT TO');
-                err.rejected = envelope.rejected;
-                err.rejectedErrors = envelope.rejectedErrors;
-                return callback(err);
-            }
+        this._advanceEnvelope(str, callback);
+    }
+    /**
+     * Moves the envelope on after a reply to MAIL FROM or RCPT TO. A pipelined envelope sent every
+     * command at once and is decided by the reply to DATA. Otherwise the commands go one at a
+     * time: the next recipient, or once every reply is in, DATA or the error that ends the message
+     *
+     * @param str The reply that was handled
+     * @param callback Callback to run once the envelope is processed
+     * @internal
+     */
+    _advanceEnvelope(str, callback) {
+        const envelope = this._envelope;
+        if (envelope.pipelined) {
+            return;
         }
-        else if (envelope.rcptQueue.length) {
-            const nextRecipient = envelope.rcptQueue.shift();
-            this._recipientQueue.push(nextRecipient);
-            this._responseActions.push(str => {
-                this._actionRCPT(str, callback);
-            });
-            this._sendCommand('RCPT TO:<' + nextRecipient + '>' + this._getDsnRcptToArgs());
+        if (envelope.mailError) {
+            return callback(envelope.mailError);
         }
+        if (envelope.rcptQueue.length) {
+            return this._sendRcpt(envelope.rcptQueue.shift(), callback);
+        }
+        if (this._recipientQueue.length) {
+            // replies still to come
+            return;
+        }
+        const err = this._envelopeError(str);
+        if (err) {
+            return callback(err);
+        }
+        this._responseActions.push(str => {
+            this._actionDATA(str, callback);
+        });
+        this._sendCommand('DATA');
+    }
+    /**
+     * Decides how the envelope went once every reply to MAIL FROM and RCPT TO is in. Called after
+     * the last RCPT TO reply, or with PIPELINING on the reply to the DATA command sent along
+     *
+     * @param str The reply being handled
+     * @returns The error to fail the message with, or null when DATA can go ahead
+     * @internal
+     */
+    _envelopeError(str) {
+        const envelope = this._envelope;
+        if (envelope.mailError) {
+            return envelope.mailError;
+        }
+        if (envelope.accepted.length) {
+            return null;
+        }
+        // report a temporary rejection when there is one, taking the last reply would mark the
+        // whole message as permanently failed although some recipients were only deferred
+        const deferred = envelope.rejectedErrors.find(rejectedErr => rejectedErr.responseCode && rejectedErr.responseCode < 500);
+        const lastRejected = envelope.rejectedErrors[envelope.rejectedErrors.length - 1];
+        const reply = deferred?.response ?? (envelope.pipelined && lastRejected ? lastRejected.response : str);
+        // every recipient was rejected
+        const err = this._formatError("Can't send mail - all recipients were rejected", 'EENVELOPE', reply, 'RCPT TO');
+        err.rejected = envelope.rejected;
+        err.rejectedErrors = envelope.rejectedErrors;
+        return err;
     }
     /**
      * Handle response for a DATA command
      *
      * @param str Message from the server
+     * @param callback Callback to run once the envelope is processed
      * @internal
      */
     _actionDATA(str, callback) {
         const envelope = this._envelope;
+        if (envelope.pipelined) {
+            const err = this._envelopeError(str);
+            if (err) {
+                if (/^3/.test(str)) {
+                    if (envelope.mailError) {
+                        // A server that refused the sender has no transaction to end, one that
+                        // took DATA anyway can not be trusted with an empty message either.
+                        // Drop the connection instead of answering it
+                        this.close();
+                        return callback(err);
+                    }
+                    // A server must refuse DATA without an accepted recipient, this one took it
+                    // anyway. End the empty message, it has nobody to go to, so the session
+                    // stays usable
+                    this._responseActions.push(() => callback(err));
+                    this._sendCommand('.');
+                    return;
+                }
+                return callback(err);
+            }
+        }
         // response should be 354 but according to this issue https://github.com/eleith/emailjs/issues/24
         // some servers might use 250 instead, so lets check for 2 or 3 as the first digit
         if (!/^[23]/.test(str)) {
@@ -49796,6 +51586,7 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      * We expect a single response that defines if the sending succeeded or failed
      *
      * @param str Message from the server
+     * @param callback Callback to run with the final send result
      * @internal
      */
     _actionSMTPStream(str, callback) {
@@ -49812,6 +51603,7 @@ class SMTPConnection extends external_node_events_.EventEmitter {
      * @param recipient The recipient this response applies to
      * @param final Is this the final recipient?
      * @param str Message from the server
+     * @param callback Callback to run with the final send result
      * @internal
      */
     _actionLMTPStream(recipient, final, str, callback) {
@@ -49934,12 +51726,14 @@ class XOAuth2 extends external_node_stream_.Stream {
     constructor(options, logger) {
         super();
         this.options = options || {};
+        this.configError = false;
         if (options && options.serviceClient) {
             if (!options.privateKey || !options.user) {
+                // reported through getToken() rather than an 'error' event: the transports forward
+                // that event up to the Mail object, where nothing may be listening
                 const err = new Error('Options "privateKey" and "user" are required for service account!');
                 err.code = EOAUTH2;
-                setImmediate(() => this.emit('error', err));
-                return;
+                this.configError = err;
             }
             const serviceRequestTimeout = Math.min(Math.max(Number(this.options.serviceRequestTimeout) || 0, 0), 3600);
             this.options.serviceRequestTimeout = serviceRequestTimeout || 5 * 60;
@@ -49971,6 +51765,11 @@ class XOAuth2 extends external_node_stream_.Stream {
      * @param callback Callback function with error object and token string
      */
     getToken(renew, callback) {
+        // the error paths hand over the error alone
+        const done = callback;
+        if (this.configError) {
+            return done(this.configError);
+        }
         if (!renew && this.accessToken && (!this.expires || this.expires > Date.now())) {
             this.logger.debug({
                 tnx: 'OAUTH2',
@@ -49996,11 +51795,11 @@ class XOAuth2 extends external_node_stream_.Stream {
             }, 'Cannot renew access token for %s: No refresh mechanism available', this.options.user);
             const err = new Error("Can't create new access token for user");
             err.code = EOAUTH2;
-            return callback(err);
+            return done(err);
         }
         // If renewal already in progress, queue this request instead of starting another
         if (this.renewing) {
-            this.renewalQueue.push({ renew, callback });
+            this.renewalQueue.push({ renew, callback: done });
             return;
         }
         this.renewing = true;
@@ -50025,7 +51824,7 @@ class XOAuth2 extends external_node_stream_.Stream {
                 }, 'Generated new Access Token for %s', this.options.user);
             }
             // Complete original request
-            callback(err, accessToken);
+            done(err, accessToken);
         };
         if (this.provisionCallback) {
             this.provisionCallback(this.options.user, !!renew, (err, accessToken, expires) => {
@@ -50064,6 +51863,8 @@ class XOAuth2 extends external_node_stream_.Stream {
      * @param callback Callback function with error object and token string
      */
     generateToken(callback) {
+        // the error paths hand over the error alone
+        const done = callback;
         let urlOptions;
         let loggedUrlOptions;
         if (this.options.serviceClient) {
@@ -50084,7 +51885,7 @@ class XOAuth2 extends external_node_stream_.Stream {
             catch (_err) {
                 const err = new Error("Can't generate token. Check your auth options");
                 err.code = EOAUTH2;
-                return callback(err);
+                return done(err);
             }
             urlOptions = {
                 grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
@@ -50099,7 +51900,7 @@ class XOAuth2 extends external_node_stream_.Stream {
             if (!this.options.refreshToken) {
                 const err = new Error("Can't create new access token for user");
                 err.code = EOAUTH2;
-                return callback(err);
+                return done(err);
             }
             // web app - https://developers.google.com/identity/protocols/OAuth2WebServer
             urlOptions = {
@@ -50115,8 +51916,14 @@ class XOAuth2 extends external_node_stream_.Stream {
                 grant_type: 'refresh_token'
             };
         }
-        Object.assign(urlOptions, this.options.customParams);
-        Object.assign(loggedUrlOptions, this.options.customParams);
+        const customParams = this.options.customParams || {};
+        Object.assign(urlOptions, customParams);
+        // a custom param is as likely to be a client assertion or an API key as a tenant
+        // name, so the log gets the same glimpse of it that it gets of the client secret
+        for (const key of Object.keys(customParams)) {
+            const param = customParams[key];
+            loggedUrlOptions[key] = (param === undefined || param === null ? '' : String(param)).substr(0, 6) + '...';
+        }
         this.logger.debug({
             tnx: 'OAUTH2',
             user: this.options.user,
@@ -50125,13 +51932,13 @@ class XOAuth2 extends external_node_stream_.Stream {
         this.postRequest(this.options.accessUrl, urlOptions, this.options, (error, body) => {
             let data;
             if (error) {
-                return callback(error);
+                return done(error);
             }
             try {
                 data = JSON.parse(body.toString());
             }
             catch (E) {
-                return callback(E);
+                return done(E);
             }
             if (!data || typeof data !== 'object') {
                 this.logger.debug({
@@ -50141,7 +51948,7 @@ class XOAuth2 extends external_node_stream_.Stream {
                 }, 'Response: %s', (body || '').toString());
                 const err = new Error('Invalid authentication response');
                 err.code = EOAUTH2;
-                return callback(err);
+                return done(err);
             }
             const logData = Object.assign({}, data);
             if (logData.access_token) {
@@ -50163,7 +51970,7 @@ class XOAuth2 extends external_node_stream_.Stream {
                 }
                 const err = new Error(errorMessage);
                 err.code = EOAUTH2;
-                return callback(err);
+                return done(err);
             }
             if (data.access_token) {
                 this.updateToken(data.access_token, data.expires_in);
@@ -50171,7 +51978,7 @@ class XOAuth2 extends external_node_stream_.Stream {
             }
             const err = new Error('No access token');
             err.code = EOAUTH2;
-            return callback(err);
+            return done(err);
         });
     }
     /**
@@ -50205,7 +52012,10 @@ class XOAuth2 extends external_node_stream_.Stream {
             method: 'post',
             headers: params.customHeaders,
             body: payload,
-            allowErrorResponse: true
+            allowErrorResponse: true,
+            // unset falls back to the fetch default, a stalled token endpoint would otherwise keep
+            // `renewing` set and queue every later request
+            timeout: params.requestTimeout
         };
         // OAuth2 token endpoints are credential-bearing. src/fetch already
         // validates certs by default; pin rejectUnauthorized:true here so the
@@ -50292,8 +52102,7 @@ class PoolResource extends external_node_events_.EventEmitter {
             switch ((this.options.auth.type || '').toString().toUpperCase()) {
                 case 'OAUTH2': {
                     const oauth2 = new xoauth2(this.options.auth, this.logger);
-                    oauth2.provisionCallback =
-                        (this.pool.mailer && this.pool.mailer.get('oauth2_provision_cb')) || oauth2.provisionCallback;
+                    oauth2.provisionCallback = (this.pool.mailer && this.pool.mailer.get('oauth2_provision_cb')) || oauth2.provisionCallback;
                     this.auth = {
                         type: 'OAUTH2',
                         user: this.options.auth.user,
@@ -50301,7 +52110,7 @@ class PoolResource extends external_node_events_.EventEmitter {
                         method: 'XOAUTH2'
                     };
                     oauth2.on('token', (token) => this.pool.mailer.emit('token', token));
-                    oauth2.on('error', err => this.emit('error', err));
+                    oauth2.on('error', err => this._fail(err));
                     break;
                 }
                 default:
@@ -50324,6 +52133,21 @@ class PoolResource extends external_node_events_.EventEmitter {
         this._connected = false;
         this.messages = 0;
         this.available = true;
+        this._failed = false;
+        this._sending = false;
+        this._idleTimer = false;
+    }
+    /**
+     * Emits 'error' for the first failure only. A dead resource can report the same failure more
+     * than once (the connection error, then the send callback), the pool handles it once
+     * @internal
+     */
+    _fail(err) {
+        if (this._failed) {
+            return;
+        }
+        this._failed = true;
+        this.emit('error', err);
     }
     /**
      * Initiates a connection to the SMTP server
@@ -50331,12 +52155,14 @@ class PoolResource extends external_node_events_.EventEmitter {
      * @param callback Callback function to run once the connection is established or failed
      */
     connect(callback) {
-        this.pool.getSocket(this.options, (err, socketOptions) => {
+        // the proxy handshake, if any, counts against connectionTimeout as well
+        const connectStartedAt = Date.now();
+        this.pool.getSocket(Object.assign({}, this.options, { connectStartedAt }), (err, socketOptions) => {
             if (err) {
                 // nothing was connected, so no 'close' event is coming that would free the
                 // slot this resource holds in the pool, report the failure the way a failed
                 // login does
-                this.emit('error', err);
+                this._fail(err);
                 return callback(err);
             }
             let returned = false;
@@ -50353,8 +52179,22 @@ class PoolResource extends external_node_events_.EventEmitter {
                 options = Object.assign(shared_assign(false, options), socketOptions);
             }
             this.connection = new smtp_connection(options);
-            this.connection.once('error', err => {
-                this.emit('error', err);
+            this.connection._connectStartedAt = connectStartedAt;
+            this.connection.on('error', (err) => {
+                if (this._sending) {
+                    // the send callback gets the same error and decides what it means for the message
+                    return;
+                }
+                if (this._connected && isTransientError(err)) {
+                    // the server ended a connection that had nothing in flight, usually after it
+                    // was idle for a while. The 'end' that follows closes this resource
+                    this.logger.info({
+                        tnx: 'pool',
+                        cid: this.id
+                    }, 'Connection #%s was closed by the server: %s', this.id, err.message);
+                    return;
+                }
+                this._fail(err);
                 if (returned) {
                     return;
                 }
@@ -50363,33 +52203,16 @@ class PoolResource extends external_node_events_.EventEmitter {
             });
             this.connection.once('end', () => {
                 this.close();
+                returned = true;
+            });
+            this.connection.connect(err => {
                 if (returned) {
                     return;
                 }
-                returned = true;
-                const timer = setTimeout(() => {
-                    if (returned) {
-                        return;
-                    }
-                    // still have not returned, this means we have an unexpected connection close
-                    const err = new Error('Unexpected socket close');
-                    if (this.connection &&
-                        this.connection._socket &&
-                        this.connection._socket.upgrading) {
-                        // starttls connection errors
-                        err.code = ETLS;
-                    }
-                    callback(err);
-                }, 1000);
-                try {
-                    timer.unref();
-                }
-                catch (_E) {
-                    // Ignore. Happens on envs with non-node timer implementation
-                }
-            });
-            this.connection.connect(() => {
-                if (returned) {
+                if (err) {
+                    // a close before the greeting, the 'end' that follows closes this resource
+                    // and the pool requeues or fails the entry, bounded by maxRequeues
+                    returned = true;
                     return;
                 }
                 if (this.auth && (this.connection.allowsAuth || options.forceAuth)) {
@@ -50400,7 +52223,7 @@ class PoolResource extends external_node_events_.EventEmitter {
                         returned = true;
                         if (err) {
                             this.connection.close();
-                            this.emit('error', err);
+                            this._fail(err);
                             return callback(err);
                         }
                         this._connected = true;
@@ -50448,11 +52271,39 @@ class PoolResource extends external_node_events_.EventEmitter {
         if (mail.data.requireTLSExtensionEnabled) {
             envelope.requireTLSExtensionEnabled = mail.data.requireTLSExtensionEnabled;
         }
-        this.connection.send(envelope, mail.message.createReadStream(), (err, info) => {
+        this._sending = true;
+        // a connection that sent messages before may have been dropped by the server in between
+        const reused = this.messages > 0;
+        const messageStream = mail.message.createReadStream();
+        this.connection.send(envelope, messageStream, (err, info) => {
+            this._sending = false;
             this.messages++;
             if (err) {
+                if (reused && messageStream.readableDidRead === false && isTransientError(err)) {
+                    // Not a byte of the message was sent, so it can go out over another
+                    // connection. The pool requeues the message when this resource closes
+                    this.logger.info({
+                        tnx: 'pool',
+                        cid: this.id,
+                        messageId
+                    }, 'Connection #%s was closed by the server before message %s was sent: %s', this.id, messageId, err.message);
+                    this.connection.close();
+                    return;
+                }
+                if ((err.code === EENVELOPE || err.code === EMESSAGE) && err.responseCode !== 421 && !this.connection._destroyed) {
+                    // The server refused this message, the connection itself is fine. Reset the
+                    // session and keep using it instead of opening a new one
+                    this.connection.reset(resetErr => {
+                        if (resetErr) {
+                            this.connection.close();
+                            return;
+                        }
+                        this._release();
+                    });
+                    return callback(err);
+                }
                 this.connection.close();
-                this.emit('error', err);
+                this._fail(err);
                 return callback(err);
             }
             info.envelope = {
@@ -50460,28 +52311,69 @@ class PoolResource extends external_node_events_.EventEmitter {
                 to: envelope.to
             };
             info.messageId = messageId;
-            setImmediate(() => {
-                if (this.messages >= this.options.maxMessages) {
-                    const err = new Error('Resource exhausted');
-                    err.code = EMAXLIMIT;
-                    this.connection.close();
-                    this.emit('error', err);
-                }
-                else {
-                    this.pool._checkRateLimit(() => {
-                        this.available = true;
-                        this.emit('available');
-                    });
-                }
-            });
+            setImmediate(() => this._release());
             callback(null, info);
         });
+    }
+    /**
+     * Makes the connection available for the next message, or closes it once it has sent
+     * maxMessages messages
+     *
+     * @internal
+     */
+    _release() {
+        if (this.messages >= this.options.maxMessages) {
+            const err = new Error('Resource exhausted');
+            err.code = EMAXLIMIT;
+            this.connection.close();
+            this._fail(err);
+            return;
+        }
+        this.pool._checkRateLimit(() => {
+            this.available = true;
+            this._startIdleTimer();
+            this.emit('available');
+        });
+    }
+    /** @internal */
+    _startIdleTimer() {
+        if (!this.options.idleTimeout || this.options.idleTimeout < 0) {
+            return;
+        }
+        // one timer per connection, restarted every time the connection becomes available. A
+        // connection that is busy when it fires is simply not closed
+        if (this._idleTimer && typeof this._idleTimer.refresh === 'function') {
+            this._idleTimer.refresh();
+            return;
+        }
+        clearTimeout(this._idleTimer);
+        this._idleTimer = setTimeout(() => {
+            if (!this.available) {
+                return;
+            }
+            this.logger.debug({
+                tnx: 'pool',
+                cid: this.id
+            }, 'Closing connection #%s after it was idle for %sms', this.id, this.options.idleTimeout);
+            // not handed another message while it says goodbye
+            this.available = false;
+            this.connection.quit();
+        }, this.options.idleTimeout);
+        if (typeof this._idleTimer.unref === 'function') {
+            this._idleTimer.unref();
+        }
+    }
+    /** @internal */
+    _stopIdleTimer() {
+        clearTimeout(this._idleTimer);
+        this._idleTimer = false;
     }
     /**
      * Closes the connection
      */
     close() {
         this._connected = false;
+        this._stopIdleTimer();
         if (this.auth && this.auth.oauth2) {
             this.auth.oauth2.removeAllListeners();
         }
@@ -50806,6 +52698,12 @@ const services = {
         "host": "mailosaur.io",
         "port": 25
     },
+    "MailSenpai": {
+        "description": "MailSenpai (SMTP Senpai, EU)",
+        "host": "relay.mailsenpai.com",
+        "port": 2525,
+        "secure": false
+    },
     "Mailtrap": {
         "description": "Mailtrap",
         "host": "live.smtp.mailtrap.io",
@@ -50848,6 +52746,13 @@ const services = {
         "host": "smtp.office365.com",
         "port": 587,
         "secure": false
+    },
+    "Oveyon": {
+        "description": "Oveyon",
+        "host": "smtp.oveyon.com",
+        "port": 587,
+        "secure": false,
+        "requireTLS": true
     },
     "Postmark": {
         "description": "Postmark",
@@ -51205,6 +53110,10 @@ function wellKnown(key) {
 
 
 
+/** First delay before a requeued message is retried, doubled on every further requeue */
+const REQUEUE_BASE_DELAY = 50;
+/** Upper bound for the requeue delay */
+const REQUEUE_MAX_DELAY = 2000;
 /**
  * Creates a SMTP pool transport object for Nodemailer
  *
@@ -51236,6 +53145,11 @@ class SMTPPool extends external_node_events_.EventEmitter {
         );
         this.options.maxConnections = this.options.maxConnections || 5;
         this.options.maxMessages = this.options.maxMessages || 100;
+        // a default bound, a server that closes every connection before the greeting would otherwise be retried forever
+        this.options.maxRequeues = typeof this.options.maxRequeues === 'number' ? this.options.maxRequeues : 5;
+        // below the 5 minutes RFC 5321 asks servers to wait at least, the connection is closed by us
+        // and not by the server in the middle of handing it a message
+        this.options.idleTimeout = typeof this.options.idleTimeout === 'number' ? this.options.idleTimeout : 4 * 60 * 1000;
         this.logger = getLogger(this.options, {
             component: this.options.component || 'smtp-pool'
         });
@@ -51253,6 +53167,7 @@ class SMTPPool extends external_node_events_.EventEmitter {
         this._queue = [];
         this._connections = [];
         this._connectionCounter = 0;
+        this._pending = 0;
         this.idling = true;
         setImmediate(() => {
             if (this.idling) {
@@ -51279,12 +53194,26 @@ class SMTPPool extends external_node_events_.EventEmitter {
      */
     send(mail, callback) {
         if (this._closed) {
+            // Mail.sendMail ignores the return value, so without a callback its promise would never settle
+            const err = new Error('Connection pool was closed');
+            err.code = ECONNECTION;
+            setImmediate(() => callback(err));
             return false;
         }
+        // counted until the callback runs, whichever path runs it: delivered, failed, requeued
+        // until it gives up, or drained by close()
+        let counted = true;
+        this._pending++;
         this._queue.push({
             mail,
             requeueAttempts: 0,
-            callback
+            callback: (err, info) => {
+                if (counted) {
+                    counted = false;
+                    this._pending--;
+                }
+                callback(err, info);
+            }
         });
         if (this.idling && this._queue.length >= this.options.maxConnections) {
             this.idling = false;
@@ -51492,15 +53421,22 @@ class SMTPPool extends external_node_events_.EventEmitter {
                 // Note that we must wait a bit.. because the callback of the 'error' handler might be called
                 // in the next event loop
                 setTimeout(() => {
+                    let delay = 0;
                     if (connection.queueEntry) {
                         if (this._shouldRequeuOnConnectionClose(connection.queueEntry)) {
-                            this._requeueEntryOnConnectionClose(connection);
+                            delay = this._requeueEntryOnConnectionClose(connection);
                         }
                         else {
                             this._failDeliveryOnConnectionClose(connection);
                         }
                     }
-                    this._continueProcessing();
+                    if (delay) {
+                        // back off, a server that keeps dropping connections is not hammered
+                        setTimeout(() => this._continueProcessing(), delay);
+                    }
+                    else {
+                        this._continueProcessing();
+                    }
                 }, 50);
             }
             else {
@@ -51515,7 +53451,7 @@ class SMTPPool extends external_node_events_.EventEmitter {
     }
     /** @internal */
     _shouldRequeuOnConnectionClose(queueEntry) {
-        if (this.options.maxRequeues === undefined || this.options.maxRequeues < 0) {
+        if (this.options.maxRequeues < 0) {
             return true;
         }
         return queueEntry.requeueAttempts < this.options.maxRequeues;
@@ -51524,7 +53460,9 @@ class SMTPPool extends external_node_events_.EventEmitter {
     _failDeliveryOnConnectionClose(connection) {
         if (connection.queueEntry && connection.queueEntry.callback) {
             try {
-                connection.queueEntry.callback(new Error('Reached maximum number of retries after connection was closed'));
+                const err = new Error('Reached maximum number of retries after connection was closed');
+                err.code = ECONNECTION;
+                connection.queueEntry.callback(err);
             }
             catch (E) {
                 this.logger.error({
@@ -51539,6 +53477,7 @@ class SMTPPool extends external_node_events_.EventEmitter {
     }
     /** @internal */
     _requeueEntryOnConnectionClose(connection) {
+        const delay = Math.min(REQUEUE_BASE_DELAY * 2 ** connection.queueEntry.requeueAttempts, REQUEUE_MAX_DELAY);
         connection.queueEntry.requeueAttempts += 1;
         this.logger.debug({
             tnx: 'pool',
@@ -51548,6 +53487,7 @@ class SMTPPool extends external_node_events_.EventEmitter {
         }, 'Re-queued message <%s> for #%s. Attempt: #%s', connection.queueEntry.messageId, connection.id, connection.queueEntry.requeueAttempts);
         this._queue.unshift(connection.queueEntry);
         connection.queueEntry = false;
+        return delay;
     }
     /**
      * Continue to process message if the pool hasn't closed
@@ -51617,6 +53557,19 @@ class SMTPPool extends external_node_events_.EventEmitter {
     isIdle() {
         return this.idling;
     }
+    /**
+     * Counts the messages the pool has not finished with yet: the ones waiting in the queue
+     * plus the ones a connection is transmitting right now. isIdle() only tells whether the
+     * pool can take another message, it is already true while a message is still being sent,
+     * so use this to check that nothing would be lost by closing the pool. A message that is
+     * re-queued after its connection dropped is counted until its callback runs, also while it waits to be put back on the queue, and
+     * it is no longer counted by the time its callback runs.
+     *
+     * @returns Number of queued and in-flight messages
+     */
+    pendingCount() {
+        return this._pending;
+    }
     verify(callback) {
         let promise;
         if (!callback) {
@@ -51624,10 +53577,14 @@ class SMTPPool extends external_node_events_.EventEmitter {
                 callback = callbackPromise(resolve, reject);
             });
         }
+        // the error paths hand over the error alone
+        const done = callback;
         const auth = new PoolResource(this).auth;
-        this.getSocket(this.options, (err, socketOptions) => {
+        // the proxy handshake, if any, counts against connectionTimeout as well
+        const connectStartedAt = Date.now();
+        this.getSocket(Object.assign({}, this.options, { connectStartedAt }), (err, socketOptions) => {
             if (err) {
-                return callback(err);
+                return done(err);
             }
             let options = this.options;
             if (socketOptions && socketOptions.connection) {
@@ -51642,6 +53599,7 @@ class SMTPPool extends external_node_events_.EventEmitter {
                 options = Object.assign(shared_assign(false, options), socketOptions);
             }
             const connection = new smtp_connection(options);
+            connection._connectStartedAt = connectStartedAt;
             let returned = false;
             connection.once('error', err => {
                 if (returned) {
@@ -51649,14 +53607,14 @@ class SMTPPool extends external_node_events_.EventEmitter {
                 }
                 returned = true;
                 connection.close();
-                return callback(err);
+                return done(err);
             });
             connection.once('end', () => {
                 if (returned) {
                     return;
                 }
                 returned = true;
-                return callback(new Error('Connection closed'));
+                return done(new Error('Connection closed'));
             });
             const finalize = () => {
                 if (returned) {
@@ -51664,11 +53622,16 @@ class SMTPPool extends external_node_events_.EventEmitter {
                 }
                 returned = true;
                 connection.quit();
-                return callback(null, true);
+                return done(null, true);
             };
-            connection.connect(() => {
+            connection.connect(err => {
                 if (returned) {
                     return;
+                }
+                if (err) {
+                    returned = true;
+                    connection.close();
+                    return done(err);
                 }
                 if (auth && (connection.allowsAuth || options.forceAuth)) {
                     connection.login(auth, err => {
@@ -51678,7 +53641,7 @@ class SMTPPool extends external_node_events_.EventEmitter {
                         if (err) {
                             returned = true;
                             connection.close();
-                            return callback(err);
+                            return done(err);
                         }
                         finalize();
                     });
@@ -51688,7 +53651,7 @@ class SMTPPool extends external_node_events_.EventEmitter {
                     err.code = ENOAUTH;
                     returned = true;
                     connection.close();
-                    return callback(err);
+                    return done(err);
                 }
                 else {
                     finalize();
@@ -51708,6 +53671,13 @@ class SMTPPool extends external_node_events_.EventEmitter {
 
 
 
+// The keys a message's `auth` may set on top of the transport's auth settings: the ones that
+// say who logs in and with what. Everything else in the auth block (accessUrl, clientId,
+// clientSecret, customHeaders, customParams, tls, privateKey, serviceClient and the rest)
+// names the endpoint the credentials go to or is a secret of the application itself, and
+// a message that could set `auth.accessUrl` and force a refresh would have the transport's
+// client secret and refresh token posted to a URL of its choosing
+const MESSAGE_AUTH_KEYS = ['type', 'user', 'pass', 'accessToken', 'refreshToken', 'expires'];
 /**
  * Creates a SMTP transport object for Nodemailer
  *
@@ -51767,7 +53737,11 @@ class SMTPTransport extends external_node_events_.EventEmitter {
             }
             return this.auth;
         }
-        const authData = Object.assign({}, this.options.auth && typeof this.options.auth === 'object' ? this.options.auth : {}, typeof authOpts === 'object' ? authOpts : {});
+        const authData = Object.assign({}, this.options.auth && typeof this.options.auth === 'object' ? this.options.auth : {});
+        if (typeof authOpts === 'object') {
+            // see MESSAGE_AUTH_KEYS
+            copyOwnKeys(authData, authOpts, key => !MESSAGE_AUTH_KEYS.includes(key));
+        }
         if (Object.keys(authData).length === 0) {
             return false;
         }
@@ -51807,7 +53781,9 @@ class SMTPTransport extends external_node_events_.EventEmitter {
      * @param callback Callback function
      */
     send(mail, callback) {
-        this.getSocket(this.options, (err, socketOptions) => {
+        // the proxy handshake, if any, counts against connectionTimeout as well
+        const connectStartedAt = Date.now();
+        this.getSocket(Object.assign({}, this.options, { connectStartedAt }), (err, socketOptions) => {
             if (err) {
                 return callback(err);
             }
@@ -51826,6 +53802,7 @@ class SMTPTransport extends external_node_events_.EventEmitter {
                 options = Object.assign(shared_assign(false, options), socketOptions);
             }
             const connection = new smtp_connection(options);
+            connection._connectStartedAt = connectStartedAt;
             let perCallAuth;
             const cleanupPerCallAuth = () => {
                 if (perCallAuth && perCallAuth !== this.auth && perCallAuth.oauth2) {
@@ -51841,31 +53818,6 @@ class SMTPTransport extends external_node_events_.EventEmitter {
                 cleanupPerCallAuth();
                 connection.close();
                 return callback(err);
-            });
-            connection.once('end', () => {
-                if (returned) {
-                    return;
-                }
-                const timer = setTimeout(() => {
-                    if (returned) {
-                        return;
-                    }
-                    returned = true;
-                    cleanupPerCallAuth();
-                    // still have not returned, this means we have an unexpected connection close
-                    const err = new Error('Unexpected socket close');
-                    if (connection && connection._socket && connection._socket.upgrading) {
-                        // starttls connection errors
-                        err.code = ETLS;
-                    }
-                    callback(err);
-                }, 1000);
-                try {
-                    timer.unref();
-                }
-                catch (_E) {
-                    // Ignore. Happens on envs with non-node timer implementation
-                }
             });
             const sendMessage = () => {
                 const envelope = mail.message.getEnvelope();
@@ -51886,6 +53838,10 @@ class SMTPTransport extends external_node_events_.EventEmitter {
                     messageId
                 }, 'Sending message %s to <%s>', messageId, recipients.join(', '));
                 connection.send(envelope, mail.message.createReadStream(), (err, info) => {
+                    if (returned) {
+                        // the connection error handler has already reported this send
+                        return;
+                    }
                     returned = true;
                     cleanupPerCallAuth();
                     connection.close();
@@ -51912,9 +53868,15 @@ class SMTPTransport extends external_node_events_.EventEmitter {
                     }
                 });
             };
-            connection.connect(() => {
+            connection.connect(err => {
                 if (returned) {
                     return;
+                }
+                if (err) {
+                    // the server closed the connection before the greeting
+                    returned = true;
+                    connection.close();
+                    return callback(err);
                 }
                 perCallAuth = this.getAuth(mail.data.auth);
                 if (perCallAuth && (connection.allowsAuth || options.forceAuth)) {
@@ -51944,9 +53906,13 @@ class SMTPTransport extends external_node_events_.EventEmitter {
                 callback = callbackPromise(resolve, reject);
             });
         }
-        this.getSocket(this.options, (err, socketOptions) => {
+        // the error paths hand over the error alone
+        const done = callback;
+        // the proxy handshake, if any, counts against connectionTimeout as well
+        const connectStartedAt = Date.now();
+        this.getSocket(Object.assign({}, this.options, { connectStartedAt }), (err, socketOptions) => {
             if (err) {
-                return callback(err);
+                return done(err);
             }
             let options = this.options;
             if (socketOptions && socketOptions.connection) {
@@ -51961,6 +53927,7 @@ class SMTPTransport extends external_node_events_.EventEmitter {
                 options = Object.assign(shared_assign(false, options), socketOptions);
             }
             const connection = new smtp_connection(options);
+            connection._connectStartedAt = connectStartedAt;
             let returned = false;
             let perCallAuth;
             const cleanupPerCallAuth = () => {
@@ -51976,7 +53943,7 @@ class SMTPTransport extends external_node_events_.EventEmitter {
                 returned = true;
                 cleanupPerCallAuth();
                 connection.close();
-                return callback(err);
+                return done(err);
             });
             connection.once('end', () => {
                 if (returned) {
@@ -51984,7 +53951,7 @@ class SMTPTransport extends external_node_events_.EventEmitter {
                 }
                 returned = true;
                 cleanupPerCallAuth();
-                return callback(new Error('Connection closed'));
+                return done(new Error('Connection closed'));
             });
             const finalize = () => {
                 if (returned) {
@@ -51993,11 +53960,16 @@ class SMTPTransport extends external_node_events_.EventEmitter {
                 returned = true;
                 cleanupPerCallAuth();
                 connection.quit();
-                return callback(null, true);
+                return done(null, true);
             };
-            connection.connect(() => {
+            connection.connect(err => {
                 if (returned) {
                     return;
+                }
+                if (err) {
+                    returned = true;
+                    connection.close();
+                    return done(err);
                 }
                 perCallAuth = this.getAuth({});
                 if (perCallAuth && (connection.allowsAuth || options.forceAuth)) {
@@ -52009,7 +53981,7 @@ class SMTPTransport extends external_node_events_.EventEmitter {
                         if (err) {
                             returned = true;
                             connection.close();
-                            return callback(err);
+                            return done(err);
                         }
                         finalize();
                     });
@@ -52020,7 +53992,7 @@ class SMTPTransport extends external_node_events_.EventEmitter {
                     returned = true;
                     cleanupPerCallAuth();
                     connection.close();
-                    return callback(err);
+                    return done(err);
                 }
                 else {
                     finalize();
@@ -52050,6 +54022,9 @@ const external_node_child_process_namespaceObject = require("node:child_process"
 
 
 
+
+// how long an stdin error waits for the exit code of the process before it is reported
+const STDIN_ERROR_EXIT_WAIT = 1000;
 /**
  * Generates a Transport object for Sendmail
  *
@@ -52114,9 +54089,7 @@ class SendmailTransport {
             return done(err);
         }
         // force -i to keep single dots
-        const args = this.args
-            ? ['-i'].concat(this.args).concat(envelope.to)
-            : ['-i'].concat(envelope.from ? ['-f', envelope.from] : []).concat(envelope.to);
+        const args = this.args ? ['-i'].concat(this.args).concat(envelope.to) : ['-i'].concat(envelope.from ? ['-f', envelope.from] : []).concat(envelope.to);
         const callback = (err) => {
             if (returned) {
                 // ignore any additional responses, already done
@@ -52147,37 +54120,75 @@ class SendmailTransport {
             return callback(E);
         }
         if (sendmail) {
+            let stream;
+            // ended once the whole message was handed to stdin
+            const messageWritten = () => !!stream && stream.readableEnded;
+            // an EPIPE says less than the exit code that usually follows it, so it is only
+            // reported when the process exits without one
+            let stdinError = null;
+            // releases whatever the message is still being read from
+            const release = () => {
+                if (stream && !messageWritten()) {
+                    stream.destroy();
+                }
+            };
+            const fail = (err) => {
+                release();
+                callback(err);
+            };
             sendmail.on('error', err => {
                 this.logger.error({
                     err,
                     tnx: 'spawn',
                     messageId
                 }, 'Error occurred when sending message %s. %s', messageId, err.message);
-                callback(err);
+                fail(err);
             });
-            sendmail.once('exit', code => {
-                if (!code) {
+            // 'close' follows 'exit' with the same arguments, it is only listened to in case the
+            // process ends without an 'exit' event
+            const onExit = (code, signal) => {
+                let err = null;
+                if (code) {
+                    err = new Error(code === 127 ? 'Sendmail command not found, process exited with code ' + code : 'Sendmail exited with code ' + code);
+                }
+                else if (signal) {
+                    err = new Error('Sendmail was terminated by ' + signal);
+                }
+                else if (!messageWritten()) {
+                    // exiting with 0 before the message was written does not mean it was queued
+                    err = new Error('Sendmail exited before the message was written');
+                }
+                else if (stdinError) {
+                    err = stdinError;
+                }
+                if (!err) {
                     return callback();
                 }
-                const err = new Error(code === 127 ? 'Sendmail command not found, process exited with code ' + code : 'Sendmail exited with code ' + code);
-                err.code = ESENDMAIL;
+                err.code = err.code || ESENDMAIL;
                 this.logger.error({
                     err,
                     tnx: 'stdin',
                     messageId
                 }, 'Error sending message %s to sendmail. %s', messageId, err.message);
-                callback(err);
-            });
-            // the close listener is handed the exit code as its first argument, so a non-zero
-            // code reaching it before the exit listener did counts as the error value
-            sendmail.once('close', callback);
+                fail(err);
+            };
+            sendmail.once('exit', onExit);
+            sendmail.once('close', onExit);
             sendmail.stdin.on('error', err => {
                 this.logger.error({
                     err,
                     tnx: 'stdin',
                     messageId
                 }, 'Error occurred when piping message %s to sendmail. %s', messageId, err.message);
-                callback(err);
+                if (stdinError) {
+                    return;
+                }
+                stdinError = err;
+                release();
+                // a process that closed its stdin normally exits right after, with a code that
+                // tells more than the EPIPE. Report the EPIPE if it does not
+                const exitTimer = setTimeout(() => fail(err), STDIN_ERROR_EXIT_WAIT);
+                sendmail.once('exit', () => clearTimeout(exitTimer));
             });
             const recipients = [].concat(envelope.to || []);
             if (recipients.length > 3) {
@@ -52188,12 +54199,11 @@ class SendmailTransport {
                 messageId
             }, 'Sending message %s to <%s>', messageId, recipients.join(', '));
             const sourceStream = mail.message.createReadStream();
-            let stream = sourceStream;
+            stream = sourceStream;
             if (this.options.newline) {
                 // apply the transport-level line ending transform; the message-level
                 // `newline` option is handled by MimeNode in createReadStream()
-                stream = sourceStream.pipe(this.winbreak ? new LeWindows() : new LeUnix());
-                sourceStream.once('error', err => stream.emit('error', err));
+                stream = (0,external_node_stream_.pipeline)(sourceStream, this.winbreak ? new LeWindows() : new LeUnix(), () => false);
             }
             stream.once('error', err => {
                 this.logger.error({
@@ -52374,6 +54384,8 @@ class JSONTransport {
                 }
                 delete data.envelope;
                 delete data.normalizedHeaders;
+                // the message field is the object itself with skipEncoding, the
+                // createTransport overload for that option types the result accordingly
                 return done(null, {
                     envelope,
                     messageId,
@@ -52611,10 +54623,12 @@ class SESTransport extends external_node_events_ {
 
 
 
-const ETHEREAL_API = (process.env.ETHEREAL_API || 'https://api.nodemailer.com').replace(/\/+$/, '');
-const ETHEREAL_WEB = (process.env.ETHEREAL_WEB || 'https://ethereal.email').replace(/\/+$/, '');
-const ETHEREAL_API_KEY = (process.env.ETHEREAL_API_KEY || '').replace(/\s*/g, '') || null;
-const ETHEREAL_CACHE = ['true', 'yes', 'y', '1'].includes((process.env.ETHEREAL_CACHE || 'yes').toString().trim().toLowerCase());
+// Read on use rather than at load, so that importing the module does not touch the
+// environment (Deno refuses that without --allow-env, even for apps that never use Ethereal)
+const etherealApi = () => (process.env.ETHEREAL_API || 'https://api.nodemailer.com').replace(/\/+$/, '');
+const etherealWeb = () => (process.env.ETHEREAL_WEB || 'https://ethereal.email').replace(/\/+$/, '');
+const etherealApiKey = () => (process.env.ETHEREAL_API_KEY || '').replace(/\s*/g, '') || null;
+const etherealCache = () => ['true', 'yes', 'y', '1'].includes((process.env.ETHEREAL_CACHE || 'yes').toString().trim().toLowerCase());
 let testAccount = false;
 function createTransport(transporter, defaults) {
     let options;
@@ -52675,11 +54689,11 @@ function createTestAccount(apiUrl, callback) {
         });
     }
     const done = callback;
-    if (ETHEREAL_CACHE && testAccount) {
+    if (etherealCache() && testAccount) {
         setImmediate(() => done(null, testAccount));
         return promise;
     }
-    apiUrl = apiUrl || ETHEREAL_API;
+    apiUrl = apiUrl || etherealApi();
     const chunks = [];
     let chunklen = 0;
     const requestHeaders = {};
@@ -52687,8 +54701,9 @@ function createTestAccount(apiUrl, callback) {
         requestor: package_info_name,
         version: package_info_version
     };
-    if (ETHEREAL_API_KEY) {
-        requestHeaders.Authorization = 'Bearer ' + ETHEREAL_API_KEY;
+    const apiKey = etherealApiKey();
+    if (apiKey) {
+        requestHeaders.Authorization = 'Bearer ' + apiKey;
     }
     const fetchOptions = {
         contentType: 'application/json',
@@ -52756,7 +54771,7 @@ function getTestMessageUrl(info) {
         }
     }
     if (infoProps.has('STATUS') && infoProps.has('MSGID')) {
-        return ((testAccount && testAccount.web) || ETHEREAL_WEB) + '/message/' + infoProps.get('MSGID');
+        return ((testAccount && testAccount.web) || etherealWeb()) + '/message/' + infoProps.get('MSGID');
     }
     return false;
 }
@@ -68199,17 +70214,17 @@ async function validateSubscription() {
 function setupEnvelope(envelopeFrom, envelopeTo, from, to, cc, bcc) {
     if (envelopeFrom || envelopeTo) {
         // Take address in from, if envelopeFrom is not set.
-        envelopeFrom = envelopeFrom ? addressparser(envelopeFrom) : addressparser(from);
+        envelopeFrom = envelopeFrom ? esm_addressparser(envelopeFrom) : esm_addressparser(from);
         if (envelopeFrom.length != 1 || envelopeFrom[0].address == '') {
             throw new Error("'envelopeFrom' address is invalid");
         }
         if (envelopeTo) {
-            envelopeTo = addressparser(envelopeTo);
+            envelopeTo = esm_addressparser(envelopeTo);
         } else {
             // Take addresses in to, cc and bcc. Deduplication is handled by nodemailer.
             for (const src of [to, cc, bcc]) {
                 if (src) {
-                    let parsed = addressparser(src);
+                    let parsed = esm_addressparser(src);
                     envelopeTo = envelopeTo ? envelopeTo.concat(parsed) : parsed;
                 }
             }
@@ -68297,7 +70312,7 @@ async function main() {
 
         // Basic check for an email sender address
         // Either: "Plain Simple Name <user@doma.in>" or just "user@doma.in" (without the <>)
-        let parsed = addressparser(from);
+        let parsed = esm_addressparser(from);
         if (parsed.length != 1 || parsed[0].address == '') {
             // Report an error only if the user did not set envelope_from. Otherwise, envelope_from
             // overrides from anyway and from is used as is (but Nodemailer will remove
