@@ -1,5 +1,8 @@
 {
-  "name": "action-send-mail",
+  "name": "@step-security/action-send-mail",
+  "private": true,
+  "author": "step-security",
+  "publisher": "step-security",
   "main": "dist/index.js",
   "description": "An action that simply sends a mail to multiple recipients.",
   "version": "18.0.0",
@@ -19,8 +22,12 @@
     "@actions/core": "^3.0.1",
     "axios": "^1.20.0",
     "@actions/glob": "^0.7.0",
-    "nodemailer": "^10.0.8",
+    "nodemailer": "^10.0.11",
     "@vercel/ncc": "^0.38.1",
     "showdown": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=24",
+    "npm": ">=11"
   }
 }

@@ -143,14 +143,12 @@ async function main() {
 
         let serverAddress = core.getInput("server_address");
         let serverPort = core.getInput("server_port");
-        let secure = core.getInput("secure");
-        const requireTLS = core.getInput("require_tls", { required: false });
+        let secure = core.getInput("secure")
+            ? core.getBooleanInput("secure")
+            : undefined;
+        let requireTLS = core.getInput("require_tls", { required: false });
         let username = core.getInput("username");
         let password = core.getInput("password");
-
-        if (!secure) {
-            secure = serverPort === "465" ? "true" : "false";
-        }
 
         const connectionUrl = core.getInput("connection_url");
         if (connectionUrl) {
@@ -162,11 +160,15 @@ async function main() {
                     );
                 case "smtp:":
                     serverPort = "25";
-                    secure = "false";
+                    break;
+                case "smtps:":
+                    serverPort = "465";
+                    secure = true;
                     break;
                 case "smtp+starttls:":
-                    serverPort = "465";
-                    secure = "true";
+                    serverPort = "587";
+                    secure = false;
+                    requireTLS = "true";
                     break;
             }
             if (url.hostname) {
@@ -183,6 +185,10 @@ async function main() {
             }
         }
 
+        if (secure === undefined) {
+            secure = serverPort === "465";
+        }
+
         const subject = core.getInput("subject", { required: true });
         const from = core.getInput("from", { required: true });
         const to = core.getInput("to", { required: false });
@@ -193,7 +199,7 @@ async function main() {
         const replyTo = core.getInput("reply_to", { required: false });
         const inReplyTo = core.getInput("in_reply_to", { required: false });
         const attachments = core.getInput("attachments", { required: false });
-        const convertMarkdown = core.getInput("convert_markdown", {
+        const convertMarkdown = core.getBooleanInput("convert_markdown", {
             required: false,
         });
         const ignoreCert = core.getInput("ignore_cert", { required: false });
@@ -246,7 +252,7 @@ async function main() {
                       }
                     : undefined,
             port: serverPort,
-            secure: secure === "true",
+            secure: secure,
             requireTLS: requireTLS === "true",
             tls:
                 ignoreCert == "true"
