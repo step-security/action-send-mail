@@ -26,4 +26,4 @@ jobs:
       - name: 'Dependency Review'
         uses: actions/dependency-review-action@0efb1d1d84fc9633afcdaad14c485cbbc90ef46c # v2.5.1
         with:
-          allow-ghsas: GHSA-rmmh-p597-ppvv
+          allow-ghsas: GHSA-rmmh-p597-ppvv, GHSA-g3hv-75wg-m249

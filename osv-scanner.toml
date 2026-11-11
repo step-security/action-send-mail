@@ -1,3 +1,15 @@
 [[IgnoredVulns]]
 id = "GHSA-rmmh-p597-ppvv"
 reason = "XSS in showdown does not apply: markdown input is action-operator-controlled and output is an email body, not a web page."
+
+[[IgnoredVulns]]
+id = "GHSA-22g5-r2x5-97cx"
+reason = "XSS in showdown does not apply: markdown input is action-operator-controlled and output is an email body, not a web page."
+
+[[IgnoredVulns]]
+id = "GHSA-cr32-g25g-vxjj"
+reason = "XSS in showdown does not apply: markdown input is action-operator-controlled and output is an email body, not a web page."
+
+[[IgnoredVulns]]
+id = "GHSA-g3hv-75wg-m249"
+reason = "ReDoS in minimatch does not apply: the glob pattern comes from the workflow-author-controlled 'attachments' input, not from any external or untrusted user input. No fix available yet in @actions/glob (still depends on minimatch ^10.2.5)."
